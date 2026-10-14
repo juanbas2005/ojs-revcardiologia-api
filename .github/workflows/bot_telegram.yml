@@ -1,0 +1,27 @@
+name: Bot Telegram
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 */6 * * *"   # respaldo opcional; lo normal es dispatch manual
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar dependencias
+        run: pip install requests
+      - name: Arrancar bot de Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OJS_USER: ${{ secrets.OJS_USER }}
+          OJS_PASS: ${{ secrets.OJS_PASS }}
+          OJS_PASS_REVCARD: ${{ secrets.OJS_PASS_REVCARD }}
+          OJS_JOURNAL: revcardiologia
+          PART_MB: "5"
+          IDLE_MIN: "30"
+        run: python bot_telegram.py
