@@ -7,6 +7,7 @@
       "journal": "revcardiologia",
       "versionOJS": "3.3.0.18",
       "compatible": true,
+      "limite_mb": 18,
       "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "existente (ya usada para subir)" }
     },
     {
@@ -15,6 +16,7 @@
       "journal": "mil",
       "versionOJS": "3.3.0.18",
       "compatible": true,
+      "limite_mb": 18,
       "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "registrada (activa)" }
     },
     {
@@ -23,6 +25,7 @@
       "journal": "rme",
       "versionOJS": "3.3.0.18",
       "compatible": true,
+      "limite_mb": 18,
       "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "registrada (activa)" }
     },
     {
@@ -31,6 +34,7 @@
       "journal": "cocmed",
       "versionOJS": "3.3.0.18",
       "compatible": true,
+      "limite_mb": 16,
       "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "registrada (activa), subida probada OK" }
     },
     {
@@ -39,6 +43,7 @@
       "journal": "ems",
       "versionOJS": "3.3.0.18",
       "compatible": true,
+      "limite_mb": 18,
       "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "registrada (activa), subida probada OK" }
     },
     {
@@ -47,6 +52,7 @@
       "journal": "spu",
       "versionOJS": "3.3.0.18",
       "compatible": true,
+      "limite_mb": null,
       "cuenta": { "username": "--", "email": "riroennis@gmail.com", "estado": "correo ya en uso: existe cuenta preexistente" }
     },
     {
