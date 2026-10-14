@@ -1,0 +1,28 @@
+name: Probar límite de MB por archivo
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+jobs:
+  limite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Instalar dependencias
+        run: pip install requests
+      - name: Probar límite de MB por revista
+        env:
+          OJS_USER: ${{ secrets.OJS_USER }}
+          OJS_PASS: ${{ secrets.OJS_PASS }}
+          OJS_PASS_REVCARD: ${{ secrets.OJS_PASS_REVCARD }}
+        run: python3 tests/limite_archivo.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: limite-resultado
+          path: limite_resultado.json

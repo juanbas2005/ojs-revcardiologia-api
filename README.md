@@ -16,7 +16,25 @@ Reimplementa el flujo del wizard de OJS + su REST API:
 - Python 3.8+
 - `pip install -r requirements.txt`
 
-## Uso (CLI)
+## Elige la revista (revistas.json)
+
+El archivo **`revistas.json`** es el registro de revistas cubanas OJS. Puedes
+apuntar el script a cualquiera con `--journal` (slug o nombre):
+
+```bash
+python ojs_api.py --journal rme --user TU_USUARIO --password TU_CLAVE --file a.pdf
+python ojs_api.py --journal mil --user ... --password ... --file a.pdf
+```
+
+| Slug | Revista | OJS | Compatible |
+|------|---------|-----|------------|
+| `revcardiologia` | Rev. Cubana de Cardiología | 3.3.0.18 | ✅ |
+| `mil` | Rev. Cubana de Medicina Militar | 3.3.0.18 | ✅ |
+| `rme` | Rev. Electrónica Dr. Zoilo E. Marinello | 3.3.0.18 | ✅ |
+| `spu` | Rev. Cubana de Salud Pública | 3.3.0.18 | ✅ |
+| `medicentro` | Medicentro (Villa Clara) | 2.3.8.0 | ❌ (OJS 2.x) |
+
+## Uso (CLI)  
 
 ```bash
 python ojs_api.py \

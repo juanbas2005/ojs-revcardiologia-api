@@ -37,6 +37,7 @@ class OJSApi:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0")
         self.session.verify = False
         self.csrf = None
+        self.journal = journal
 
     def login(self):
         r = self.session.get(f"{self.base}/login")
@@ -64,25 +65,40 @@ class OJSApi:
         if m:
             self.csrf = m
 
-    def create(self, section_id="25", user_group_id="14", locale="es_ES"):
-        """Crea una submission nueva vía el wizard y devuelve su id."""
+    def create(self, section_id=None, user_group_id=None, locale="es_ES"):
+        """Crea una submission nueva vía el wizard y devuelve su id.
+
+        Descubre automáticamente sectionId (Art. Investigación) y userGroupId
+        del paso 1, y envía los checkboxes de la lista de verificación (cada
+        revista define cuántos y con qué nombre).
+        """
         r = self.session.get(
             f"{self.base}/submission/step/1?submissionId=&sectionId=0")
         d = json.loads(r.text)
-        csrf = re.search(r'name="csrfToken" value="([^"]+)"', d["content"])
-        csrf = csrf.group(1) if csrf else self.csrf
-        self.session.post(f"{self.base}/submission/saveStep/1", data={
-            "csrfToken": csrf, "locale": locale, "sectionId": section_id,
-            "submissionChecklist": "1", "userGroupId": user_group_id,
-            "copyrightNoticeAgree": "1", "privacyConsent": "1",
-        })
-        # La última submission creada aparece con status=1 (nueva)
-        subs = json.loads(self.session.get(
-            f"{self.base}/api/v1/submissions?count=10&offset=0").text)
-        for item in subs.get("items", []):
-            if item.get("status") == 1 and item.get("submitterId") == 2197:
-                return item["id"]
-        raise RuntimeError("No se encontró la submission recién creada")
+        content = d["content"]
+        m = re.search(r'name="csrfToken" value="([^"]+)"', content)
+        csrf = m.group(1) if m else self.csrf
+        # Sección: preferir 'Artículo de Investigación'; si no, la 1ª distinta de 0
+        secs = re.findall(r'<option value="(\d+)"[^>]*>([^<]+)</option>', content)
+        section_id = section_id or (next(
+            (s for s, n in secs if "nvestigaci" in n and "original" not in n.lower()),
+            next((s for s, _ in secs if s != "0"), None)))
+        m = re.search(r'name="userGroupId"[^>]*value="(\d+)"', content)
+        user_group_id = user_group_id or (m.group(1) if m else "14")
+        data = {"csrfToken": csrf, "locale": locale, "sectionId": section_id,
+                "userGroupId": user_group_id, "submissionChecklist": "1",
+                "copyrightNoticeAgree": "1", "privacyConsent": "1"}
+        # algunas revistas (ej. mil) exigen cada checkbox por separado
+        for i in range(len(re.findall(r'id="checklist-\d+"', content))):
+            data[f"checklist-{i}"] = "1"
+        r = self.session.post(f"{self.base}/submission/saveStep/1", data=data)
+        sub = json.loads(r.text).get("submissionId")
+        if not sub:
+            m = re.search(r"submissionId=(\d+)", r.text)
+            sub = m.group(1) if m else None
+        if not sub:
+            raise RuntimeError("No se pudo crear la submission: " + r.text[:200])
+        return sub
 
     def upload(self, submission_id, filepath, filename=None):
         """Sube un archivo a la submission y devuelve el diccionario de OJS."""
@@ -101,15 +117,29 @@ class OJSApi:
     def download_url(self, submission_id, submission_file_id, stage_id="1"):
         """Enlace de descarga del archivo (requiere sesión para abrirlo)."""
         host = self.base.split("/index.php")[0]
-        return (f"{host}/index.php/revcardiologia/$$$call$$$/api/file/"
+        return (f"{host}/index.php/{self.journal}/$$$call$$$/api/file/"
                 f"file-api/download-file?submissionFileId={submission_file_id}"
                 f"&submissionId={submission_id}&stageId={stage_id}")
 
 
+def cargar_revista(nombre):
+    """Devuelve (host, journal) de revistas.json por slug o nombre."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "revistas.json"), encoding="utf-8") as f:
+        for r in json.load(f)["revistas"]:
+            if nombre.lower() in (r["journal"].lower(), r["nombre"].lower()):
+                if not r.get("compatible", True):
+                    raise SystemExit(f"{r['nombre']} es OJS {r['versionOJS']}: no compatible")
+                return r["host"], r["journal"]
+    raise SystemExit(f"Revista no encontrada: {nombre} (mira revistas.json)")
+
+
 if __name__ == "__main__":
     import argparse
-    p = argparse.ArgumentParser(description="Subir archivo a OJS revcardiologia")
+    p = argparse.ArgumentParser(description="Subir archivo a OJS (revistas cubanas)")
     p.add_argument("--host", default="https://revcardiologia.sld.cu")
+    p.add_argument("--journal", default="revcardiologia",
+                   help="slug o nombre de la revista (ver revistas.json)")
     p.add_argument("--user", required=True)
     p.add_argument("--password", required=True)
     p.add_argument("--file", required=True, help="ruta del archivo a subir")
@@ -118,8 +148,10 @@ if __name__ == "__main__":
     p.add_argument("--genre", default="1")
     args = p.parse_args()
 
-    api = OJSApi(args.host, args.user, args.password,
-                 genre_id=args.genre)
+    host, journal = cargar_revista(args.journal) if args.journal != \
+        "revcardiologia" else (args.host, "revcardiologia")
+    api = OJSApi(host, args.user, args.password,
+                 journal=journal, genre_id=args.genre)
     api.login()
     log.info("Sesión iniciada.")
     sub = args.submission or api.create(section_id=args.section)

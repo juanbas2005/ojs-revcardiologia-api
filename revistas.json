@@ -1,0 +1,62 @@
+{
+  "descripcion": "Registro de revistas cubanas sobre OJS (Open Journal Systems). Campos: host, journal (slug de /index.php/), versionOJS, cuenta. Solo las 3.3 son compatibles con ojs_api.py. La contraseña no se incluye en el repo (seguridad): se guarda en credenciales.txt local.",
+  "revistas": [
+    {
+      "nombre": "Revista Cubana de Cardiología y Cirugía Cardiovascular",
+      "host": "https://revcardiologia.sld.cu",
+      "journal": "revcardiologia",
+      "versionOJS": "3.3.0.18",
+      "compatible": true,
+      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "existente (ya usada para subir)" }
+    },
+    {
+      "nombre": "Revista Cubana de Medicina Militar",
+      "host": "https://revmedmilitar.sld.cu",
+      "journal": "mil",
+      "versionOJS": "3.3.0.18",
+      "compatible": true,
+      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "registrada (activa)" }
+    },
+    {
+      "nombre": "Revista Electrónica Dr. Zoilo E. Marinello Vidaurreta",
+      "host": "https://revmedicaelectronica.sld.cu",
+      "journal": "rme",
+      "versionOJS": "3.3.0.18",
+      "compatible": true,
+      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "registrada (activa)" }
+    },
+    {
+      "nombre": "Revista Cubana de Medicina General Integral (Cocmed)",
+      "host": "https://revcocmed.sld.cu",
+      "journal": "cocmed",
+      "versionOJS": "3.3.0.18",
+      "compatible": true,
+      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "registrada (activa), subida probada OK" }
+    },
+    {
+      "nombre": "Revista Cubana de Educmédica Superior (EMS)",
+      "host": "https://ems.sld.cu",
+      "journal": "ems",
+      "versionOJS": "3.3.0.18",
+      "compatible": true,
+      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "registrada (activa), subida probada OK" }
+    },
+    {
+      "nombre": "Revista Cubana de Salud Pública",
+      "host": "https://revsaludpublica.sld.cu",
+      "journal": "spu",
+      "versionOJS": "3.3.0.18",
+      "compatible": true,
+      "cuenta": { "username": "--", "email": "riroennis@gmail.com", "estado": "correo ya en uso: existe cuenta preexistente" }
+    },
+    {
+      "nombre": "Medicentro (Villa Clara)",
+      "host": "https://medicentro.sld.cu",
+      "journal": "medicentro",
+      "versionOJS": "2.3.8.0",
+      "compatible": false,
+      "nota": "OJS 2.x: API distinta, no compatible con ojs_api.py",
+      "cuenta": { "estado": "no registrada" }
+    }
+  ]
+}
