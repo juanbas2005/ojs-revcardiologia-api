@@ -11,6 +11,7 @@ import os
 import re
 import json
 import sys
+import time
 
 import requests
 requests.packages.urllib3.disable_warnings()
@@ -58,10 +59,21 @@ def upload(api, sub, path, mb):
 
 def find_limit(host, journal, password):
     api = OJSApi(host, USERNAME, password, journal=journal)
-    try:
-        api.login()
-    except Exception as e:
-        return {"revista": journal, "estado": f"login falló: {e}"}
+    # el DNS de .sld.cu a veces falla transitoriamente: reintentar
+    ok = False
+    for _ in range(3):
+        try:
+            api.login()
+            ok = True
+            break
+        except Exception as e:
+            print(f"  {journal}: login reintentando ({e})")
+            time.sleep(15)
+    if not ok:
+        try:
+            api.login()
+        except Exception as e:
+            return {"revista": journal, "estado": f"login falló: {e}"}
     try:
         sub = int(api.create())
     except Exception as e:
