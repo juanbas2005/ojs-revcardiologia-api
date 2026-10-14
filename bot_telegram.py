@@ -67,10 +67,11 @@ def handle_document(msg):
     base = os.path.splitext(name)[0]
     local = os.path.join(tmp, f"tg_{int(time.time())}_{name}")
     try:
-        p, _ = tg_get("/getFile", params={"file_id": doc["file_id"]}).json()["result"]
-        tg_get(f"/{p}", stream=True)
-        shutil.copyfileobj(requests.get(f"{API}/{p}", stream=True,
-                          timeout=1800).raw, open(local, "wb"))
+        j = tg_get("/getFile", params={"file_id": doc["file_id"]}).json()["result"]
+        p = j["file_path"]
+        r = tg_get(f"/{p}", stream=True)
+        with open(local, "wb") as out:
+            shutil.copyfileobj(r.raw, out)
     except Exception as e:
         send(chat, f"Fallo al descargar de Telegram: {e}")
         return
@@ -78,7 +79,7 @@ def handle_document(msg):
     ext = os.path.splitext(name)[1]
     lines = []
     lines.append(f"# «{name}» ({size} bytes), {PART_MB} MB por parte")
-    lines.append(f"# Submission {sub} en https://.sld.cu/{journal}\n")
+    lines.append(f"# Submission {sub} en {journal}")
     idx = 0
     with open(local, "rb") as f:
         while True:
@@ -118,8 +119,7 @@ def handle_update(u):
         handle_document(msg)
 
 
-start = time.time()
-if __name__ == "__main__":
+def main():
     while True:
         try:
             r = requests.get(f"{API}/getUpdates", params={"timeout": 25},
@@ -132,3 +132,8 @@ if __name__ == "__main__":
         if time.time() > start + int(os.environ.get("IDLE_MIN", "30")) * 60:
             print("Sin actividad; cerrando el job de Actions.")
             return
+
+
+start = time.time()
+if __name__ == "__main__":
+    main()
