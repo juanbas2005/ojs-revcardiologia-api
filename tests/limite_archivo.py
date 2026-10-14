@@ -16,7 +16,7 @@ import requests
 requests.packages.urllib3.disable_warnings()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, ".."))
 from ojs_api import OJSApi  # noqa: E402
 
 USERNAME = os.environ["OJS_USER"]
