@@ -16,7 +16,8 @@ import requests
 requests.packages.urllib3.disable_warnings()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, ".."))
+ROOT = os.path.join(HERE, "..")
+sys.path.insert(0, ROOT)
 from ojs_api import OJSApi  # noqa: E402
 
 USERNAME = os.environ["OJS_USER"]
@@ -101,7 +102,7 @@ def find_limit(host, journal, password):
 
 
 def main():
-    with open(os.path.join(HERE, "revistas.json"), encoding="utf-8") as f:
+    with open(os.path.join(ROOT, "revistas.json"), encoding="utf-8") as f:
         revistas = json.load(f)["revistas"]
     resultados = []
     for r in revistas:
@@ -115,7 +116,7 @@ def main():
 
     salida = json.dumps({"resultados": resultados}, ensure_ascii=False, indent=2)
     print("\n=== RESULTADO FINAL ===\n" + salida)
-    with open(os.path.join(HERE, "limite_resultado.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(ROOT, "limite_resultado.json"), "w", encoding="utf-8") as f:
         f.write(salida)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
