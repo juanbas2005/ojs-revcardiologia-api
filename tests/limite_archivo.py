@@ -42,7 +42,8 @@ def upload(api, sub, path, mb):
             r = api.session.post(
                 f"{api.base}/api/v1/submissions/{sub}/files",
                 headers={"X-CSRF-TOKEN": api.csrf},
-                files={"file": (f"prueba_{mb}MB.bin", f)},
+                files={"file": (f"prueba_{mb}MB.pdf", f,
+                                "application/pdf")},
                 data={"fileStage": api.file_stage, "genreId": api.genre_id},
                 timeout=900)
     except Exception as e:
