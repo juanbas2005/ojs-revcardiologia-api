@@ -1,0 +1,76 @@
+# PROMPT PARA OTRA IA — Sistema OJS + Bot de Telegram
+
+Actúa como un desarrollador sénior experto en Open Journal Systems (OJS 3.3), GitHub Actions, bots de Telegram en Python y Pyrogram. Trabajas sobre un repo de GitHub privado que ya existe y está totalmente montado. Tu objetivo: PRUEBA el sistema completo, corrígelo, mejóralo de forma robusta y entrega un bot completo y funcional.
+
+## 1) Autorización de GitHub (instala gh y entra a mi cuenta)
+Ejecuta: `gh auth login --with-token` y pega este token de GitHub (cuenta juanbas2005):
+```
+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
+```
+Verifica con `gh auth status`. NOTA: el repo es PRIVADO, pero igualmente NUNCA subas credenciales ni tokens a archivos rastreados por git; guárdalos en GitHub Secrets o en archivos locales ignorados.
+
+## 2) El repo
+`git clone https://github.com/juanbas2005/ojs-revcardiologia-api.git` (rama master).
+Estructura: `ojs_api.py` (núcleo de subida/descarga a OJS), `revistas.json` (revistas cubanas y su `limite_mb`), `bot_telegram.py` (bot de Telegram con `requests`, polling), `tests/limite_archivo.py`, workflows en `.github/workflows/` (`bot_telegram.yml`, `limite_subida.yml`), `requirements.txt`, `README.md`, y este archivo `PROMPT_OTRA_IA.txt`.
+
+## 3) Credenciales de las "nubes" (revistas OJS cubanas)
+Usuario común: riroennis
+- Password para mil, rme, cocmed, ems, spu: Riroennis@2026
+- Password para revcardiologia: Pupi@#1212
+Revistas (host base + slug):
+- revcardiologia: https://revcardiologia.sld.cu/index.php/revcardiologia
+- mil: https://revmedmilitar.sld.cu/index.php/mil
+- rme: https://revmedicaelectronica.sld.cu/index.php/rme
+- cocmed: https://revcocmed.sld.cu/index.php/cocmed
+- ems: https://ems.sld.cu/index.php/ems
+- spu: https://spu.sld.cu/index.php/spu (cuenta ya existe, verificar acceso)
+- medicentro: OJS 2.x (NO compatible, ignorar o documentar)
+
+## 4) Token del bot de Telegram
+```
+8484852335:AAEPpjUhD9ZCRmcHBIiAgZ1bzQftSKMElQs
+```
+Verifícalo con getMe. Se usa en GitHub Secrets como `TELEGRAM_BOT_TOKEN` para el workflow del bot y en la app local.
+
+## 5) Variables de Pyrogram / sesión
+Pyrogram necesita un `api_id` y `api_hash` de my.telegram.org para sesión MTProto. Si no se tienen, usar el modo Bot con el token (la API de bot no requiere api_id/hash). Configurar como variables de entorno o archivo `config.json`:
+- `API_ID` y `API_HASH` (si los tienes de mtproto)
+- `SESSION_NAME` (caso del bot: bot token vía `pyrogram.Client(":mem:")` con `bot_token=...`)
+- Puedes prescindir de api_id/hash usando bot_token; documentar ambas vías.
+
+## 6) PRUEBA TODO EL SISTEMA (lo principal)
+Realiza TODAS las pruebas de subida por archivo y de límite de MB por archivo contra CADA revista OJS, conectándote por HTTP/curl o con la librería requests (NO hay navegador). Para cada revista:
+1. Login con CSRF (`GET /login` → extraer csrfToken → `POST /login/signIn` → 302 con cookie OJSSID).
+2. Probar subida multipart a `POST /api/v1/submissions/{id}/files` (headers `X-CSRF-TOKEN`, campos `fileStage=2` y `genreId=1`).
+3. Determinar el `limite_mb` real por archivo en cada revista (sin romper nada, archivos pequeños). Actualiza `revistas.json` con los límites verdaderos.
+4. Comprobar que la descarga por `download-file?submissionFileId=...&submissionId=...&stageId=1` funciona SIEMPRE con login (avisar si OJS restringe por rol).
+5. Buscar y corregir TODOS los errores existentes (404, roleBasedAccessDenied, csrfInvalid, timeouts, DNS).
+
+## 7) Script de descarga integrado en el bot
+Crear `descargar_enlace.py` y QUE ESTÉ DISPONIBLE COMO OPCIÓN del bot (comando `/script` o botón "Ver script") que envíe el .py al chat para ejecutarlo y descargar los enlaces que el bot produce. El script debe hacer login automáticamente, aceptar .txt o URLs sueltas, guardar en ~/Descargas. Robusto y sencillo.
+
+## 8) Mejora completa del bot (usar Pyrogram)
+Reescríbelo con Pyrogram (cliente MTProto) con ESTAS funciones:
+- Módulos de descarga desde más sitios: YouTube (yt-dlp), TikTok, Instagram, y enlaces directos genéricos (http/https), además de archivos enviados al chat. Si el enlace es de una web, intentar obtenerlo.
+- Administrador de archivos dentro del bot: renombrar, recortar, comprimir, y "todas las funciones de archivo" (zip, tamaño, borrar temporales).
+- Ajustes/configuración (puerto, límite, revista por defecto, idioma).
+- Barra de progreso de descarga de archivos de Telegram o enlaces.
+- Barra de progreso de SUBIDA a cada revista OJS.
+- Botón para copiar los enlaces de un toque (inline).
+- Persistencia y robustez: manejar errores, reintentos, timeouts.
+- Mantener API de subida a OJS con separación de partes de 5 MB y renombrado a .pdf cuando la extensión no esté permitida.
+
+## 9) Acción de GitHub para que el bot se mantenga corriendo sin errores
+Crea un workflow que ejecute el bot de forma continua y auto-reiniciable:
+- Un workflow `bot_keepalive.yml` (o mejorar `bot_telegram.yml`) que haga polling largo y, si el job se corta por timeout (30 min idle / 40 min job), se relance automáticamente.
+- Solución sugerida: estrategia de "restart": tener un supervisor en Python que recomece el bucle ante caídas; y/o un cron (`schedule`) que dispare el job cada N minutos para re-levantarlo si murió.
+- Comprobación automática de salud: el workflow debe verificar que el bot sigue vivo (getMe/getUpdates) y, si no, re-despacharlo.
+- Documentar el límite de GitHub Actions y sugerir host 24/7 (VPS/Replit) como alternativa.
+
+## 10) Entrega
+- Código funcional en el repo, `py_compile` limpio, commit/push bien estructurados.
+- Resumen de cada prueba: revista, archivo, resultado (subida OK, límite en MB, descarga OK/error).
+- Archivo `GUIA.md` con cómo usar el bot y el script de descarga.
+- Pedir confirmación antes de cambiar cosas sensibles.
+
+IMPORTANTE: no borres ni rompas las submissions reales del usuario; trabaja con archivos de prueba pequeños. Mantén el idioma español. Todo en un flujo con git limpio.
