@@ -115,10 +115,13 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 
 
 def tg_get(method, params=None, timeout=60):
+    # Aceptar method con o sin '/' inicial (normalizar a uno solo)
+    method = method.lstrip("/")
     return requests.get(f"{API}/{method}", params=params, timeout=timeout)
 
 
 def tg_post(method, data=None, files=None, timeout=600):
+    method = method.lstrip("/")
     return requests.post(f"{API}/{method}", data=data, files=files,
                          timeout=timeout)
 
