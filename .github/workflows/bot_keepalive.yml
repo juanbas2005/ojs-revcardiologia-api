@@ -66,6 +66,13 @@ jobs:
           PART_MB: ${{ vars.PART_MB || '5' }}
           IDLE_MIN: "30"
         run: |
+          # Sanity check: imprimir longitud del token (NO su valor)
+          echo "TELEGRAM_BOT_TOKEN length: ${#TELEGRAM_BOT_TOKEN}"
+          echo "TELEGRAM_BOT_TOKEN first 8: ${TELEGRAM_BOT_TOKEN:0:8}..."
+          echo "OJS_USER: '$OJS_USER'"
+          # Llamada directa a getMe para descartar problemas de red del runner
+          GETME=$(curl -sS -m 15 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe")
+          echo "getMe raw: $GETME"
           # Si API_ID y API_HASH están definidos, usar Pyrogram; si no, simple.
           if [ -n "\${{ secrets.API_ID }}" ] && [ -n "\${{ secrets.API_HASH }}" ]; then
             echo "Usando bot_telegram.py (Pyrogram)"
