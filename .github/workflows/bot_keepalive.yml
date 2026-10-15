@@ -1,0 +1,83 @@
+name: Bot Telegram (simple, keepalive)
+
+# Workflow principal del bot. Usa la version SIMPLE (solo requests, sin
+# api_id/api_hash). Para usar la version Pyrogram, define API_ID y API_HASH
+# en GitHub Secrets y cambia el run a `python bot_telegram.py`.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Cada 30 minutos se relanza el job. Si el job actual sigue corriendo
+    # GitHub Actions no crea duplicados (un job con el mismo nombre no se
+    # solapa en el mismo runner). Si el job ya murió por timeout/idle, se
+    # levanta uno nuevo automáticamente.
+    - cron: "*/30 * * * *"
+
+# Evitar que se acumulen varios jobs del mismo bot en paralelo
+concurrency:
+  group: bot-telegram
+  cancel-in-progress: false
+
+jobs:
+  health-check:
+    name: Verificar token de Telegram
+    runs-on: ubuntu-latest
+    outputs:
+      alive: ${{ steps.check.outputs.alive }}
+    steps:
+      - name: Comprobar getMe
+        id: check
+        run: |
+          set -e
+          CODE=$(curl -s -o /tmp/me.json -w "%{http_code}" \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/getMe")
+          echo "HTTP $CODE"
+          if [ "$CODE" = "200" ] && jq -e .ok /tmp/me.json >/dev/null; then
+            echo "alive=true" >> $GITHUB_OUTPUT
+            jq -r '.result | "Bot: @\(.username) (id=\(.id))"' /tmp/me.json
+          else
+            echo "alive=false" >> $GITHUB_OUTPUT
+            echo "Bot no responde a getMe:"
+            cat /tmp/me.json
+          fi
+
+  bot:
+    name: Ejecutar bot
+    needs: health-check
+    if: needs.health-check.outputs.alive == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Arrancar bot (polling, 30 min idle)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OJS_USER: ${{ secrets.OJS_USER }}
+          OJS_PASS: ${{ secrets.OJS_PASS }}
+          OJS_PASS_REVCARD: ${{ secrets.OJS_PASS_REVCARD }}
+          OJS_JOURNAL: ${{ vars.OJS_JOURNAL || 'revcardiologia' }}
+          PART_MB: ${{ vars.PART_MB || '5' }}
+          IDLE_MIN: "30"
+        run: |
+          # Si API_ID y API_HASH están definidos, usar Pyrogram; si no, simple.
+          if [ -n "\${{ secrets.API_ID }}" ] && [ -n "\${{ secrets.API_HASH }}" ]; then
+            echo "Usando bot_telegram.py (Pyrogram)"
+            API_ID="\${{ secrets.API_ID }}" API_HASH="\${{ secrets.API_HASH }}" \
+              python bot_telegram.py
+          else
+            echo "Usando bot_telegram_simple.py (requests)"
+            python bot_telegram_simple.py
+          fi
+      - name: Resumen
+        if: always()
+        run: |
+          echo "## Bot Telegram" >> $GITHUB_STEP_SUMMARY
+          echo "Estado del job: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "El cron cada 30 min relanza el bot si murió." >> $GITHUB_STEP_SUMMARY

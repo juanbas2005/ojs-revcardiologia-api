@@ -1,8 +1,10 @@
-name: Bot Telegram
+name: Bot Telegram (legacy, dispatch manual)
+
+# Workflow original, mantenido para dispatch manual. El workflow principal
+# con auto-restart está en bot_keepalive.yml.
+
 on:
   workflow_dispatch: {}
-  schedule:
-    - cron: "0 */6 * * *"   # respaldo opcional; lo normal es dispatch manual
 
 jobs:
   bot:
@@ -14,8 +16,10 @@ jobs:
         with:
           python-version: "3.11"
       - name: Instalar dependencias
-        run: pip install requests
-      - name: Arrancar bot de Telegram
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Arrancar bot (simple, polling)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           OJS_USER: ${{ secrets.OJS_USER }}
@@ -24,4 +28,4 @@ jobs:
           OJS_JOURNAL: revcardiologia
           PART_MB: "5"
           IDLE_MIN: "30"
-        run: python bot_telegram.py
+        run: python bot_telegram_simple.py
