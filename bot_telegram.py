@@ -63,11 +63,12 @@ def procesar(chat, file_id, nombre, size):
     ext = os.path.splitext(nombre)[1].lstrip(".").lower()
     journal = CHOSEN.get(chat, JOURNAL_DEFAULT)
 
+    # OJS solo acepta unas extensiones: renombramos a .pdf cualquier otra
+    # (video, audio, etc.) para que la revista lo admita.
     if ext not in EXT_PERMITIDAS:
-        send(chat, f"⚠️ El tipo **.{ext or '?'}** no lo acepta OJS. "
-                   f"Permitidas: {', '.join(sorted(EXT_PERMITIDAS))}. "
-                   f"Convierte el archivo (p. ej. video a .pdf/.docx) y reenvíalo.")
-        return
+        send(chat, f"ℹ️ «{nombre}» es tipo **.{ext or '?'}** (no permitido); "
+                   f"lo renombro a **.pdf** para que la revista lo acepte.")
+        nombre = base + ".pdf"
 
     send(chat, f"Recibí «{nombre}» ({size} bytes). Partiendo en "
                f"{PART_MB} MB y subiendo a **{journal}**...")
@@ -145,9 +146,9 @@ def handle_callback(cb):
     data = cb["data"]
     msg = cb["message"]["message_id"]
     if data == "help":
-        send(chat, "Envía un archivo para partir y subir. Elige la nube con "
-                   "botones. Las revistas no aceptan media (mp4/mov/audio). "
-                   "Convierte a .pdf/.docx antes de enviar.")
+        send(chat, "Envía un archivo o video para partir y subir; lo renombro "
+                   "a .pdf si hace falta. Elige la nube con los botones. "
+                   "(/start para el menú)")
         return
     CHOSEN[chat] = data
     tg_post("answerCallbackQuery",
