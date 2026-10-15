@@ -11,3 +11,4 @@ ojs_bot.session
 ojs_bot.session-journal
 session/
 venv/
+credenciales_ojs.py
