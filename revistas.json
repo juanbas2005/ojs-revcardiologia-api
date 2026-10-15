@@ -1,14 +1,22 @@
 {
-  "descripcion": "Registro de revistas cubanas sobre OJS (Open Journal Systems). Campos: host, journal (slug de /index.php/), versionOJS, cuenta. Solo las 3.3 son compatibles con ojs_api.py. La contraseña no se incluye en el repo (seguridad): se guarda en credenciales.txt local.",
+  "descripcion": "Registro de revistas cubanas sobre OJS (Open Journal Systems). Campos: host, journal (slug de /index.php/), versionOJS, compatible, limite_mb (maximo tamano de archivo que se pudo subir en pruebas reales). La contrasenia no se incluye en el repo (seguridad): se guarda en GitHub Secrets o en .secrets/.env local (ignorado por git).",
+  "notas_pruebas": {
+    "fecha": "2026-10-16",
+    "limite_mb_real": 19,
+    "limite_mb_techo": 20,
+    "error_en_exceder": "api.submissionFiles.400.noFileStageId (sintoma de post_max_size PHP excedido)",
+    "spu_estado": "credenciales rechazadas silenciosamente; requiere atencion manual del usuario",
+    "submissions_prueba_creadas": "revcardiologia: 3562,3563 | mil: 77876,77877 | rme: 7875 | cocmed: 5740,5741 | ems: 5402,5403 (NO eliminadas; el usuario puede borrarlas)"
+  },
   "revistas": [
     {
-      "nombre": "Revista Cubana de Cardiología y Cirugía Cardiovascular",
+      "nombre": "Revista Cubana de Cardiologia y Cirugia Cardiovascular",
       "host": "https://revcardiologia.sld.cu",
       "journal": "revcardiologia",
       "versionOJS": "3.3.0.18",
       "compatible": true,
-      "limite_mb": 18,
-      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "existente (ya usada para subir)" }
+      "limite_mb": 19,
+      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "login OK; subida OK; descarga OK" }
     },
     {
       "nombre": "Revista Cubana de Medicina Militar",
@@ -16,17 +24,17 @@
       "journal": "mil",
       "versionOJS": "3.3.0.18",
       "compatible": true,
-      "limite_mb": 18,
-      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "registrada (activa)" }
+      "limite_mb": 19,
+      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "login OK; subida OK; descarga OK" }
     },
     {
-      "nombre": "Revista Electrónica Dr. Zoilo E. Marinello Vidaurreta",
+      "nombre": "Revista Electronica Dr. Zoilo E. Marinello Vidaurreta",
       "host": "https://revmedicaelectronica.sld.cu",
       "journal": "rme",
       "versionOJS": "3.3.0.18",
       "compatible": true,
-      "limite_mb": 18,
-      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "registrada (activa)" }
+      "limite_mb": 19,
+      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "login OK; subida OK; descarga OK" }
     },
     {
       "nombre": "Revista Cubana de Medicina General Integral (Cocmed)",
@@ -34,26 +42,27 @@
       "journal": "cocmed",
       "versionOJS": "3.3.0.18",
       "compatible": true,
-      "limite_mb": 16,
-      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "registrada (activa), subida probada OK" }
+      "limite_mb": 19,
+      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "login OK; subida OK; descarga OK" }
     },
     {
-      "nombre": "Revista Cubana de Educmédica Superior (EMS)",
+      "nombre": "Revista Cubana de Educacion Medica Superior (EMS)",
       "host": "https://ems.sld.cu",
       "journal": "ems",
       "versionOJS": "3.3.0.18",
       "compatible": true,
-      "limite_mb": 18,
-      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "registrada (activa), subida probada OK" }
+      "limite_mb": 19,
+      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "login OK; subida OK; descarga OK" }
     },
     {
-      "nombre": "Revista Cubana de Salud Pública",
+      "nombre": "Revista Cubana de Salud Publica",
       "host": "https://revsaludpublica.sld.cu",
       "journal": "spu",
       "versionOJS": "3.3.0.18",
       "compatible": true,
-      "limite_mb": null,
-      "cuenta": { "username": "--", "email": "riroennis@gmail.com", "estado": "correo ya en uso: existe cuenta preexistente" }
+      "limite_mb": 19,
+      "nota_host": "El host correcto es revsaludpublica.sld.cu (NO spu.sld.cu, que no resuelve en DNS).",
+      "cuenta": { "username": "riroennis", "email": "riroennis@gmail.com", "estado": "REQUIERE ATENCION: credenciales rechazadas silenciosamente (POST /login/signIn devuelve 200 con pagina de login). Verificar usuario/password en https://revsaludpublica.sld.cu/login" }
     },
     {
       "nombre": "Medicentro (Villa Clara)",
