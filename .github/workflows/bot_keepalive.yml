@@ -62,24 +62,31 @@ jobs:
           OJS_USER: ${{ secrets.OJS_USER }}
           OJS_PASS: ${{ secrets.OJS_PASS }}
           OJS_PASS_REVCARD: ${{ secrets.OJS_PASS_REVCARD }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
           OJS_JOURNAL: ${{ vars.OJS_JOURNAL || 'revcardiologia' }}
           PART_MB: ${{ vars.PART_MB || '5' }}
           IDLE_MIN: "30"
         run: |
-          # Sanity check: imprimir longitud del token (NO su valor)
+          # Sanity check (sin imprimir valores secretos)
           echo "TELEGRAM_BOT_TOKEN length: ${#TELEGRAM_BOT_TOKEN}"
-          echo "TELEGRAM_BOT_TOKEN first 8: ${TELEGRAM_BOT_TOKEN:0:8}..."
-          echo "OJS_USER: '$OJS_USER'"
-          # Llamada directa a getMe para descartar problemas de red del runner
+          echo "OJS_USER length: ${#OJS_USER}"
+          # getMe directo para descartar problemas de red
           GETME=$(curl -sS -m 15 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe")
-          echo "getMe raw: $GETME"
-          # Si API_ID y API_HASH están definidos, usar Pyrogram; si no, simple.
-          if [ -n "\${{ secrets.API_ID }}" ] && [ -n "\${{ secrets.API_HASH }}" ]; then
-            echo "Usando bot_telegram.py (Pyrogram)"
-            API_ID="\${{ secrets.API_ID }}" API_HASH="\${{ secrets.API_HASH }}" \
-              python bot_telegram.py
+          echo "getMe: $(echo $GETME | jq -c '{ok,username:.result.username // .description}' 2>/dev/null || echo $GETME)"
+          if ! echo "$GETME" | jq -e .ok >/dev/null 2>&1; then
+            echo "ERROR: getMe fallo. Abortando."
+            exit 1
+          fi
+
+          # Decidir bot: si API_ID Y API_HASH estan definidos como no-vacios,
+          # usar Pyrogram; si no, el simple.
+          if [ -n "$API_ID" ] && [ -n "$API_HASH" ] && \
+             [ "$API_ID" != "API_ID" ] && [ "$API_HASH" != "API_HASH" ]; then
+            echo ">>> Usando bot_telegram.py (Pyrogram, api_id=$API_ID)"
+            python bot_telegram.py
           else
-            echo "Usando bot_telegram_simple.py (requests)"
+            echo ">>> Usando bot_telegram_simple.py (requests, sin api_id/hash)"
             python bot_telegram_simple.py
           fi
       - name: Resumen
