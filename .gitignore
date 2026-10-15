@@ -1,5 +1,13 @@
-__pycache__/
 *.pyc
+*.session
+.env
+.secrets/
 .venv/
-venv/
+__pycache__/
+config.json
 env.py
+limite_resultado.json
+ojs_bot.session
+ojs_bot.session-journal
+session/
+venv/

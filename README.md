@@ -1,100 +1,109 @@
-# OJS Revcardiologia — API de subida de archivos
+# OJS Revcardiologia — API + Bot Telegram para revistas cubanas
 
-API en Python para subir archivos a la revista **Revista Cubana de Cardiología
-y Cirugía Cardiovascular** (OJS 3.3) ubicada en:
+Sistema para subir archivos a revistas cubanas OJS 3.3 y descargarlos,
+con un bot de Telegram que automatiza el flujo.
+
+## Estructura
 
 ```
-https://revcardiologia.sld.cu/index.php/revcardiologia
+.
+├── ojs_api.py               # Núcleo: login + subida + descarga OJS
+├── bot_telegram.py          # Bot con Pyrogram (requiere API_ID/API_HASH)
+├── bot_telegram_simple.py   # Bot con solo requests (sin api_id/hash) — DEFAULT
+├── descargar_enlace.py      # Script standalone para descargar enlaces OJS
+├── revistas.json            # Registro de revistas cubanas + límites MB
+├── requirements.txt         # Dependencias Python
+├── tests/
+│   └── limite_archivo.py    # Prueba de límite de MB por revista
+├── .github/workflows/
+│   ├── bot_keepalive.yml    # Workflow principal: bot + cron + health check
+│   ├── bot_telegram.yml     # Workflow legacy (dispatch manual)
+│   └── limite_subida.yml    # Probar límites (dispatch manual)
+├── GUIA.md                  # Guía completa de uso
+└── README.md                # Este archivo
 ```
 
-Reimplementa el flujo del wizard de OJS + su REST API:
-**login con CSRF → crear submission → POST multipart a
-`/api/v1/submissions/{id}/files` → enlace de descarga.**
+## Revistas soportadas (OJS 3.3.0.18)
 
-## Requisitos
+| Slug | Revista | Host | Límite MB |
+|------|---------|------|-----------|
+| `revcardiologia` | Rev. Cubana de Cardiología | revcardiologia.sld.cu | 19 |
+| `mil` | Rev. Cubana de Medicina Militar | revmedmilitar.sld.cu | 19 |
+| `rme` | Rev. Electrónica Zoilo Marinello | revmedicaelectronica.sld.cu | 19 |
+| `cocmed` | Rev. Cubana Medicina General Integral | revcocmed.sld.cu | 19 |
+| `ems` | Rev. Cubana Educación Médica Superior | ems.sld.cu | 19 |
+| `spu` | Rev. Cubana Salud Pública | revsaludpublica.sld.cu | 19* |
+| `medicentro` | Medicentro | medicentro.sld.cu | ❌ OJS 2.x |
 
-- Python 3.8+
-- `pip install -r requirements.txt`
+(*) SPU requiere verificación de credenciales — ver `GUIA.md` §10.
 
-## Elige la revista (revistas.json)
+## Inicio rápido
 
-El archivo **`revistas.json`** es el registro de revistas cubanas OJS. Puedes
-apuntar el script a cualquiera con `--journal` (slug o nombre):
+1. **Clona** el repo y entra:
+   ```bash
+   git clone https://github.com/juanbas2005/ojs-revcardiologia-api.git
+   cd ojs-revcardiologia-api
+   ```
 
-```bash
-python ojs_api.py --journal rme --user TU_USUARIO --password TU_CLAVE --file a.pdf
-python ojs_api.py --journal mil --user ... --password ... --file a.pdf
-```
+2. **Instala** dependencias:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-| Slug | Revista | OJS | Compatible |
-|------|---------|-----|------------|
-| `revcardiologia` | Rev. Cubana de Cardiología | 3.3.0.18 | ✅ |
-| `mil` | Rev. Cubana de Medicina Militar | 3.3.0.18 | ✅ |
-| `rme` | Rev. Electrónica Dr. Zoilo E. Marinello | 3.3.0.18 | ✅ |
-| `spu` | Rev. Cubana de Salud Pública | 3.3.0.18 | ✅ |
-| `medicentro` | Medicentro (Villa Clara) | 2.3.8.0 | ❌ (OJS 2.x) |
+3. **Configura** credenciales en `.secrets/.env`:
+   ```bash
+   mkdir -p .secrets
+   cat > .secrets/.env <<'EOF'
+   TELEGRAM_BOT_TOKEN=tu-token
+   OJS_USER=riroennis
+   OJS_PASS=Riroennis@2026
+   OJS_PASS_REVCARD=Pupi@#1212
+   EOF
+   chmod 600 .secrets/.env
+   ```
 
-## Uso (CLI)  
+4. **Arranca el bot**:
+   ```bash
+   python bot_telegram_simple.py
+   ```
 
-```bash
-python ojs_api.py \
-  --user TU_USUARIO \
-  --password TU_CLAVE \
-  --file ruta/al/articulo.pdf \
-  --submission 3555        # opcional; si no, se crea una nueva
-```
+5. **Abre el bot** en Telegram (bot @Uptimeriroobot o el tuyo propio) y
+   envía `/start`.
 
-### Salida
+Para más detalles, **lee [`GUIA.md`](GUIA.md)**.
 
-```json
-{
-  "submissionId": 3555,
-  "id": 182058,
-  "fileId": 18449,
-  "name": {"es_ES": "articulo.pdf"},
-  "url": "https://revcardiologia.sld.cu/index.php/revcardiologia/$$$call$$$/api/file/file-api/download-file?..."
-}
-```
+## Cómo funciona
 
-## Uso (como módulo)
-
-```python
-from ojs_api import OJSApi
-
-api = OJSApi(
-    host="https://revcardiologia.sld.cu",
-    username="TU_USUARIO",
-    password="TU_CLAVE",
-)
-api.login()
-submission_id = api.create(section_id="25")    # opcional
-sub = api.get_submission_id()                  # o usa el que quieras
-res = api.upload(3555, "articulo.pdf")
-print(api.download_url(3555, res["id"]))
-```
-
-## Cómo funciona internamente
+### Subida a OJS (cliente `ojs_api.py`)
 
 | Paso | Endpoint | Método | Detalle |
 |------|----------|--------|---------|
 | Login | `/login` + `/login/signIn` | GET/POST | extrae `csrfToken` del formulario |
-| CSRF | `/submissions` | GET | token en `"csrfToken":"..."` del JS |
+| Verificar sesión | `/submissions` | GET | no debe redirigir a `/login` |
+| CSRF | `/submissions` o `/dashboard` | GET | token en JSON o en `value=` HTML |
 | Crear submission | `/submission/saveStep/1` | POST | checklists + `sectionId` + `userGroupId` |
-| Subir archivo | `/api/v1/submissions/{id}/files` | **POST** | multipart `file` + `fileStage=2` + `genreId` |
-| Enlace | `$$$call$$$/api/file/file-api/download-file` | GET | `submissionFileId`, `submissionId`, `stageId` |
+| Subir archivo | `/api/v1/submissions/{id}/files` | POST | multipart `file` + `fileStage=2` + `genreId=1` |
+| Enlace | `$$$call$$$/api/file/file-api/download-file` | GET | requiere sesión iniciada |
+| Descargar | el enlace anterior | GET stream | `Content-Type` debe ser binario, no HTML |
 
-### Puntos clave (por experiencia):
+### Bot (polling con `requests` o Pyrogram)
 
-- Cabecera **`X-CSRF-TOKEN`** imprescindible en las llamadas a la API.
-  Sin ella, OJS devuelve `403 form.csrfInvalid`.
-- El campo **debe llamarse `file`** y el método es **POST** (no PUT).
-- `fileStage=2` (Submission) es obligatorio; sin él → `api.submissionFiles.400.noFileStageId`.
-- Extensiones permitidas: `epub xml xls cvs doc docx pdf jpg png html gif xlsx xls`.
-  `.txt` NO está permitida; usa `.doc`, `.docx`, `.pdf` o `.html`.
-- `genreId=1` = Texto del artículo; `12` = Otro.
-- El enlace contiene `$$$call$$$`, por lo que exige **sesión iniciada**
-  (no es público). Comparte la URL con quien tenga acceso a la submission,
-  o pedid al gestor que la publique.
+- Recibe archivo/video/enlace del chat.
+- Descarga a `/tmp`.
+- Si extensión no permitida → renombra a `.pdf`.
+- Parte en trozos de `PART_MB` MB (5 por defecto, máx 19).
+- Sube cada parte a OJS (con barra de progreso).
+- Genera `.txt` con enlaces y lo envía al chat.
+
+## Límites técnicos confirmados
+
+- **Límite de MB por archivo**: 19 MB en todas las revistas OJS 3.3
+  cubanas (falla en 20 MB con `noFileStageId` — síntoma de
+  `post_max_size` PHP excedido).
+- **GitHub Actions**: 2000 min/mes, 6h por job. Usamos cron de 30 min
+  + idle de 30 min → ~1 job/hora. Recomendado VPS para 24/7 real.
+- **Pyrogram 2.x** requiere `api_id` + `api_hash` (gratis en
+  <https://my.telegram.org/apps>).
 
 ## Licencia
 
