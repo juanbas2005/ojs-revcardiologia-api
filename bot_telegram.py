@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
-Bot de Telegram con Pyrogram — arquitectura híbrida para archivos grandes.
+Bot de Telegram OJS Cubanas — versión mejorada con gestión de archivos.
 
-Estrategia:
-  - Polling HTTP de getUpdates (como bot_simple, no tiene el bug de Pyrogram).
-  - Handlers asíncronos con asyncio (más rápidos que el síncrono).
-  - Pyrogram SOLO para descargar archivos grandes (vía MTProto, sin límite 20MB).
-  - HTTP server mínimo en $PORT para Render health check.
+Mejoras vs versión anterior:
+  - Progreso global unificado: un solo % y un solo mensaje por operación
+    completa (descarga + subida de todas las partes).
+  - Botón ❌ Cancelar durante descarga/subida.
+  - Sistema de gestión de archivos: /archivos, /info, /borrar, /mover, /copiar.
+  - Estética mejorada: secciones con emojis, formatos limpios.
+  - Throttle de edición a 1s (evita FloodWait).
+  - Confirmaciones inline antes de borrar.
+  - Cola de operaciones con /cola y /cancelar.
+  - Estadísticas: /stats (uploads, downloads, tiempo total).
+  - Filtrado de callbacks por user.id (solo el dueño puede pulsar botones).
+  - Reintentos con backoff exponencial.
+  - Limpieza de temporales en finally.
 
-Requiere variables de entorno:
-  TELEGRAM_BOT_TOKEN  - token de @BotFather
-  API_ID, API_HASH    - de https://my.telegram.org/apps
-  OJS_USER, OJS_PASS, OJS_PASS_REVCARD
-  PART_MB (default 5), OJS_JOURNAL (default revcardiologia),
-  IDLE_MIN (default 0 = 24/7).
+Arquitectura híbrida:
+  - Polling HTTP de getUpdates (robusto).
+  - Handlers async directos (no dependen de Pyrogram dispatcher).
+  - Pyrogram lazy: solo arranca cuando hace falta descargar un archivo grande.
 """
 import os
 import re
@@ -26,6 +32,7 @@ import logging
 import asyncio
 import threading
 import traceback
+import hashlib
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import deque
@@ -58,7 +65,7 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("bot")
 
-LOG_BUFFER = deque(maxlen=200)
+LOG_BUFFER = deque(maxlen=300)
 
 
 class BufferHandler(logging.Handler):
@@ -90,7 +97,7 @@ if PART_MB > MAX_PART_MB:
 
 API_HTTP = f"https://api.telegram.org/bot{TOKEN}"
 
-# revistas compatibles
+# Revistas compatibles
 with open(HERE / "revistas.json", encoding="utf-8") as f:
     REVISTAS_DICT = {r["journal"]: r for r in json.load(f)["revistas"]
                      if r.get("compatible")}
@@ -101,51 +108,114 @@ EXT_PERMITIDAS = {"epub", "xml", "xls", "cvs", "doc", "docx", "pdf",
 
 # --- Persistencia -----------------------------------------------------------
 CONFIG_FILE = HERE / "config.json"
+STATS_FILE = HERE / "stats.json"
+FILES_INDEX_FILE = HERE / "files_index.json"  # catálogo de archivos subidos
 
 
-def load_config():
-    if CONFIG_FILE.exists():
+def load_json(path, default):
+    if path.exists():
         try:
-            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            return {}
-    return {}
+            return default
+    return default
 
 
-def save_config(cfg):
+def save_json(path, data):
     try:
-        CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
-                               encoding="utf-8")
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
     except Exception as e:
-        log.warning("no pude guardar config.json: %s", e)
+        log.warning("no pude guardar %s: %s", path, e)
 
 
-CONFIG = load_config()
+CONFIG = load_json(CONFIG_FILE, {})
 CHOSEN = CONFIG.get("chosen", {})
+
+STATS = load_json(STATS_FILE, {
+    "uploads": 0,           # número de archivos subidos a OJS
+    "downloads": 0,         # número de archivos descargados de Telegram
+    "bytes_uploaded": 0,    # bytes totales subidos
+    "bytes_downloaded": 0,  # bytes totales descargados
+    "parts_uploaded": 0,    # número de partes OJS
+    "errors": 0,            # número de errores
+    "start_time": time.time(),
+})
+
+FILES_INDEX = load_json(FILES_INDEX_FILE, {"files": []})
 
 
 def persist_chosen(chat_id, journal):
     CHOSEN[str(chat_id)] = journal
     CONFIG["chosen"] = CHOSEN
-    save_config(CONFIG)
+    save_json(CONFIG_FILE, CONFIG)
+
+
+def persist_stats():
+    save_json(STATS_FILE, STATS)
+
+
+def persist_files_index():
+    save_json(FILES_INDEX_FILE, FILES_INDEX)
 
 
 # --- Estado runtime ---------------------------------------------------------
-LAST_FILE = {}
-PENDING_LINKS = {}
+LAST_FILE = {}            # chat_id -> path local del último archivo
+PENDING_LINKS = {}        # chat_id -> lista de enlaces pendientes
 START_TIME = time.time()
 LAST_ACTIVITY = time.time()
 _last_edit = {}
-EDIT_THROTTLE_S = 0.8
+EDIT_THROTTLE_S = 1.0  # 1s entre ediciones para evitar FloodWait
 
-# Cliente Pyrogram (lazy init: solo arranca cuando hace falta descargar)
+# Operaciones activas: (chat_id, op_id) -> OperationState
+ACTIVE_OPS = {}
+CANCEL_FLAGS = {}  # op_id -> asyncio.Event (set = cancelado)
+OP_QUEUE = deque()  # cola de operaciones pendientes
+
+
+class OperationState:
+    """Estado de una operación larga (descarga + subida)."""
+
+    def __init__(self, op_id, chat_id, kind, name, total_size=0):
+        self.op_id = op_id
+        self.chat_id = chat_id
+        self.kind = kind  # "download", "upload", "url"
+        self.name = name
+        self.total_size = total_size
+        self.done_bytes = 0
+        self.start_time = time.time()
+        self.status_msg_id = None
+        self.cancel_event = asyncio.Event()
+        self.current_part = 0
+        self.total_parts = 0
+        self.part_pct = 0
+
+    @property
+    def global_pct(self):
+        """Porcentaje global de toda la operación (descarga + subida)."""
+        if self.total_size <= 0:
+            return 0
+        return min(self.done_bytes / self.total_size * 100, 100.0)
+
+    def status_line(self):
+        elapsed = time.time() - self.start_time
+        speed = self.done_bytes / elapsed if elapsed > 0 else 0
+        eta = ((self.total_size - self.done_bytes) / speed
+               if speed > 0 else 0)
+        return (
+            f"{progress_bar(self.done_bytes, self.total_size, width=20)} "
+            f"{self.global_pct:.1f}%\n"
+            f"📦 {human_size(self.done_bytes)} / {human_size(self.total_size)}  "
+            f"⚡ {human_speed(speed)}  ⏱ ETA {int(eta)}s"
+        )
+
+
+# --- Cliente Pyrogram (lazy) -----------------------------------------------
 _pyrogram_app = None
 _pyrogram_lock = asyncio.Lock()
 
 
 async def get_pyrogram():
-    """Devuelve la instancia de Pyrogram (lazy init).
-    Pyrogram solo se arranca cuando hace falta descargar un archivo grande."""
     global _pyrogram_app
     if _pyrogram_app is None or not _pyrogram_app.is_initialized:
         async with _pyrogram_lock:
@@ -162,6 +232,70 @@ async def get_pyrogram():
                 me = await _pyrogram_app.get_me()
                 log.info("Pyrogram listo: @%s", me.username)
     return _pyrogram_app
+
+
+# --- Helpers visuales -------------------------------------------------------
+
+
+def progress_bar(done, total, width=20):
+    """Barra de progreso visual con caracteres Unicode."""
+    if total <= 0:
+        return "▱" * width
+    frac = min(done / total, 1.0)
+    filled = int(frac * width)
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def human_size(n):
+    if n is None or n < 0:
+        return "?"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def human_speed(bps):
+    if bps <= 0:
+        return "? B/s"
+    return f"{human_size(bps)}/s"
+
+
+def safe_filename(name):
+    base, ext = os.path.splitext(name)
+    ext = ext.lstrip(".").lower()
+    if ext not in EXT_PERMITIDAS:
+        ext = "pdf"
+    return base + "." + ext, ext
+
+
+def file_md5(path, max_bytes=10 * 1024 * 1024):
+    """MD5 de los primeros N bytes (rápido, para identificación)."""
+    try:
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            h.update(f.read(max_bytes))
+        return h.hexdigest()[:12]
+    except Exception:
+        return "?"
+
+
+def file_info(path):
+    """Info detallada de un archivo local."""
+    try:
+        st = os.stat(path)
+        return {
+            "name": os.path.basename(path),
+            "size": st.st_size,
+            "size_human": human_size(st.st_size),
+            "modified": datetime.fromtimestamp(st.st_mtime).isoformat(
+                timespec="seconds"),
+            "md5": file_md5(path),
+            "ext": Path(path).suffix.lstrip(".").lower() or "—",
+        }
+    except Exception:
+        return None
 
 
 # --- Helpers HTTP a Telegram -----------------------------------------------
@@ -209,9 +343,6 @@ async def tg_send(chat_id, text, reply_markup=None, parse_mode="Markdown",
             await asyncio.sleep(wait + 1)
             r = await tg_post("sendMessage", data=data, timeout=60)
             j = r.json()
-    else:
-        log.info(">>> sendMessage OK: chat=%s msg_id=%s",
-                 chat_id, j.get("result", {}).get("message_id"))
     return j
 
 
@@ -268,45 +399,14 @@ async def answer_callback(cb_id, text=None, show_alert=False):
     await tg_post("answerCallbackQuery", data=data, timeout=10)
 
 
-# --- Helpers visuales -------------------------------------------------------
+# --- Botones ---------------------------------------------------------------
 
 
-def progress_bar(done, total, width=12):
-    if total <= 0:
-        return "░" * width + " ?"
-    frac = min(done / total, 1.0)
-    filled = int(frac * width)
-    return "█" * filled + "░" * (width - filled)
+def cancel_keyboard(op_id):
+    return [[{"text": "❌  Cancelar", "callback_data": f"cancel:{op_id}"}]]
 
 
-def human_size(n):
-    if n is None or n < 0:
-        return "?"
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
-        n /= 1024
-    return f"{n:.1f} PB"
-
-
-def human_speed(bps):
-    if bps <= 0:
-        return "? B/s"
-    return f"{human_size(bps)}/s"
-
-
-def safe_filename(name):
-    base, ext = os.path.splitext(name)
-    ext = ext.lstrip(".").lower()
-    if ext not in EXT_PERMITIDAS:
-        ext = "pdf"
-    return base + "." + ext, ext
-
-
-# --- Menús ------------------------------------------------------------------
-
-
-def menu_keyboard():
+def main_menu_keyboard():
     kb = [[{"text": f"☁️  {s}", "callback_data": f"nube:{s}"}]
           for s in JOURNAL_SLUGS]
     kb.append([
@@ -315,58 +415,62 @@ def menu_keyboard():
         {"text": "📊  Estado", "callback_data": "estado"},
     ])
     kb.append([
+        {"text": "📁  Archivos", "callback_data": "archivos"},
+        {"text": "📈  Stats", "callback_data": "stats"},
+    ])
+    kb.append([
         {"text": "📜  Script", "callback_data": "script"},
         {"text": "🧹  Limpiar", "callback_data": "limpiar"},
     ])
     return kb
 
 
-async def show_menu(chat_id, edit_msg_id=None):
-    actual = CHOSEN.get(str(chat_id), JOURNAL_DEFAULT)
-    text = (
-        f"👋 *Bot OJS Cubanas* (Pyrogram · MTProto)\n\n"
-        f"☁️ *Nube actual:* `{actual}`\n"
-        f"📦 *Tamaño de parte:* `{PART_MB} MB` (máx 19 MB)\n\n"
-        f"*¿Qué puedo hacer?*\n"
-        f"• 📤 Subir archivos de *cualquier tamaño* a OJS por partes.\n"
-        f"• ⬇️ Descargar archivos grandes desde Telegram (sin límite).\n"
-        f"• 🌐 Descargar enlaces directos http(s).\n"
-        f"• 🎬 Renombrar, recortar, comprimir archivos.\n"
-        f"• 📜 Enviarte `descargar_enlace.py`.\n\n"
-        f"👇 Elige una nube o envíame un archivo/enlace."
-    )
-    if edit_msg_id:
-        await tg_edit(chat_id, edit_msg_id, text,
-                      reply_markup=menu_keyboard(), force=True)
-    else:
-        await tg_send(chat_id, text, reply_markup=menu_keyboard())
+def help_keyboard():
+    return [[
+        {"text": "📁  Archivos", "callback_data": "archivos"},
+        {"text": "🏠  Menú", "callback_data": "menu"},
+    ]]
+
+
+# --- Textos ----------------------------------------------------------------
 
 
 def help_text():
     return (
-        "❓ *Ayuda del Bot OJS* (Pyrogram)\n\n"
-        "*Comandos disponibles:*\n\n"
+        "❓ *Ayuda — Bot OJS Cubanas*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "📤 *Subir archivos a OJS:*\n"
-        "• Envía un archivo/documento/video/foto.\n"
-        "• Lo divido en partes de `5 MB` (máx 19 MB).\n"
+        "• Envía archivo/documento/video/foto.\n"
+        "• Lo divido en partes de `" f"{PART_MB} MB" "` (máx 19 MB).\n"
         "• Renombro a `.pdf` si la extensión no está permitida.\n"
-        "• Te devuelvo un `.txt` con todos los enlaces.\n\n"
+        "• Te devuelvo un `.txt` con todos los enlaces.\n"
+        "• Barra de progreso *global* (un solo %).\n"
+        "• Botón *❌ Cancelar* durante toda la operación.\n\n"
         "⬇️ *Descargar de Internet:*\n"
-        "• Envía un enlace `http(s)` y lo descargo + subo.\n\n"
+        "• Enlace `http(s)` directo → lo descargo y subo.\n\n"
+        "📁 *Gestión de archivos:*\n"
+        "• `/archivos` — Listar archivos recientes.\n"
+        "• `/info` — Info del último archivo (tamaño, MD5, etc.).\n"
+        "• `/borrar` — Borrar el último archivo.\n"
+        "• `/mover <ruta>` — Mover el último archivo.\n"
+        "• `/copiar <ruta>` — Copiar el último archivo.\n\n"
         "⚙️ *Comandos:*\n"
         "• `/start` `/menu` — Menú principal.\n"
         "• `/ayuda` `/help` — Esta ayuda.\n"
         "• `/estado` — Estado del bot.\n"
+        "• `/stats` — Estadísticas de uso.\n"
         "• `/config` — Ver y cambiar ajustes.\n"
+        "• `/cola` — Ver cola de operaciones.\n"
+        "• `/cancelar` — Cancelar operación en curso.\n"
         "• `/script` — Recibir `descargar_enlace.py`.\n"
-        "• `/temp` — Listar archivos temporales.\n"
-        "• `/limpiar` — Borrar archivos temporales.\n"
-        "• `/renombrar <nombre>` — Renombrar último archivo.\n"
-        "• `/recortar <bytes>` — Dejar solo los primeros N bytes.\n"
-        "• `/zip` — Comprimir último archivo en `.zip`.\n"
-        "• `/size` `/tamaño` — Tamaño del último archivo.\n\n"
-        "✅ *Sin límite de tamaño:* descarga archivos vía MTProto.\n\n"
-        "⚠️ *Límite de OJS:* máximo `19 MB` por archivo subido.\n\n"
+        "• `/temp` — Listar temporales.\n"
+        "• `/limpiar` — Borrar temporales.\n"
+        "• `/renombrar <n>` — Renombrar último archivo.\n"
+        "• `/recortar <bytes>` — Dejar primeros N bytes.\n"
+        "• `/zip` — Comprimir último archivo.\n"
+        "• `/size` — Tamaño del último archivo.\n\n"
+        "✅ *Sin límite de tamaño:* descarga vía MTProto.\n"
+        "⚠️ *Límite OJS:* máximo 19 MB por archivo.\n\n"
         "💡 *Tip:* si falla una subida, usa `/limpiar` y reintenta."
     )
 
@@ -374,82 +478,179 @@ def help_text():
 def estado_text():
     uptime = int(time.time() - START_TIME)
     idle = int(time.time() - LAST_ACTIVITY)
-    pyr_status = "iniciado" if (_pyrogram_app and
-                                 _pyrogram_app.is_initialized) else "pendiente"
+    mem_mb = 0
+    try:
+        import resource
+        mem_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        mem_mb = mem_kb / 1024 if mem_kb > 1024 * 1024 else mem_kb
+    except Exception:
+        pass
+    pyr = "✅ iniciado" if (_pyrogram_app and _pyrogram_app.is_initialized) \
+        else "⏳ pendiente"
+    ops = len(ACTIVE_OPS)
+    queue = len(OP_QUEUE)
     return (
-        f"📊 *Estado del Bot* (Pyrogram híbrido)\n\n"
+        f"📊 *Estado del Bot*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"• ⏱ *Uptime:* `{timedelta(seconds=uptime)}`\n"
         f"• 🕐 *Última actividad:* {idle}s atrás\n"
+        f"• 💾 *Memoria:* `{mem_mb:.0f} MB`\n"
         f"• ☁️ *Nube por defecto:* `{JOURNAL_DEFAULT}`\n"
         f"• 📦 *PART_MB:* `{PART_MB}`\n"
         f"• 🔢 *Revistas:* `{len(JOURNAL_SLUGS)}`\n"
-        f"• 🌐 *Modo:* `{'24/7 (IDLE_MIN=0)' if IDLE_MIN == 0 else f'idle {IDLE_MIN}min'}`\n"
-        f"• ⚡ *Pyrogram MTProto:* `{pyr_status}`"
+        f"• 🌐 *Modo:* `{'24/7' if IDLE_MIN == 0 else f'idle {IDLE_MIN}min'}`\n"
+        f"• ⚡ *Pyrogram:* {pyr}\n"
+        f"• 🔄 *Operaciones activas:* `{ops}`\n"
+        f"• 📋 *Cola:* `{queue}` pendientes"
     )
 
 
-# --- Descarga de Telegram vía MTProto (sin límite de 20 MB) ----------------
+def stats_text():
+    uptime = int(time.time() - STATS.get("start_time", time.time()))
+    up = STATS.get("uploads", 0)
+    dl = STATS.get("downloads", 0)
+    bytes_up = STATS.get("bytes_uploaded", 0)
+    bytes_dl = STATS.get("bytes_downloaded", 0)
+    parts = STATS.get("parts_uploaded", 0)
+    errs = STATS.get("errors", 0)
+    return (
+        f"📈 *Estadísticas de uso*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📤 *Subidas a OJS:* `{up}` archivos\n"
+        f"📦 *Partes subidas:* `{parts}`\n"
+        f"📊 *Bytes subidos:* `{human_size(bytes_up)}`\n\n"
+        f"⬇️ *Descargas de Telegram:* `{dl}` archivos\n"
+        f"📊 *Bytes descargados:* `{human_size(bytes_dl)}`\n\n"
+        f"⚠️ *Errores:* `{errs}`\n"
+        f"⏱ *Uptime:* `{timedelta(seconds=uptime)}`\n\n"
+        f"📁 *Archivos en índice:* `{len(FILES_INDEX.get('files', []))}`"
+    )
 
 
-async def download_from_telegram(file_id, dest_path, nombre, chat_id,
-                                  status_msg_id):
+def files_list_text(limit=15):
+    files = sorted(FILES_INDEX.get("files", []),
+                   key=lambda x: x.get("ts", 0), reverse=True)[:limit]
+    if not files:
+        return "📁 *Archivos recientes*\n\n_No hay archivos registrados._"
+    text = f"📁 *Archivos recientes* ({len(files)})\n"
+    text += "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    for i, f in enumerate(files, 1):
+        emoji = "📄" if f.get("ext", "").lower() in {"pdf", "doc", "docx"} \
+            else "🎬" if f.get("ext", "").lower() in {"mp4", "avi", "mov"} \
+            else "🎵" if f.get("ext", "").lower() in {"mp3", "wav", "ogg"} \
+            else "🖼" if f.get("ext", "").lower() in {"jpg", "png", "gif"} \
+            else "📦"
+        text += (f"{emoji} `{i}.` `{f.get('name', '?')[:40]}`\n"
+                 f"    📦 {f.get('size_human', '?')} · "
+                 f"☁️ `{f.get('journal', '?')}` · "
+                 f"📅 {f.get('date', '?')[:10]}\n")
+    return text
+
+
+def file_detail_text(info):
+    if not info:
+        return "❌ No hay archivo reciente."
+    return (
+        f"📄 *Info del archivo*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"• 📝 *Nombre:* `{info['name']}`\n"
+        f"• 📦 *Tamaño:* `{info['size_human']}` ({info['size']} bytes)\n"
+        f"• 🏷 *Extensión:* `{info['ext']}`\n"
+        f"• 🔐 *MD5:* `{info['md5']}`\n"
+        f"• 📅 *Modificado:* `{info['modified']}`"
+    )
+
+
+# --- Operaciones con cancelación -------------------------------------------
+
+
+def gen_op_id():
+    return f"op_{int(time.time() * 1000)}"
+
+
+async def is_cancelled(op_id):
+    """Verifica si una operación fue cancelada."""
+    state = ACTIVE_OPS.get(op_id)
+    return state and state.cancel_event.is_set()
+
+
+async def cancel_op(op_id):
+    """Marca una operación para cancelación."""
+    state = ACTIVE_OPS.get(op_id)
+    if state:
+        state.cancel_event.set()
+        return True
+    return False
+
+
+# --- Descarga de Telegram vía MTProto ---------------------------------------
+
+
+async def download_from_telegram(file_id, dest_path, nombre, op_id):
     """Descarga un archivo de Telegram vía MTProto con barra de progreso.
-    Soporta archivos de CUALQUIER tamaño (sin límite de 20 MB de la HTTP API)."""
+    Soporta cancelación vía op_id."""
     app = await get_pyrogram()
+    state = ACTIVE_OPS.get(op_id)
+    if not state:
+        raise RuntimeError("Estado de operación no encontrado")
+
     last_update = 0
-    t0 = time.time()
 
     async def on_progress(current, total):
         nonlocal last_update
+        if await is_cancelled(op_id):
+            raise asyncio.CancelledError("cancelado por usuario")
+        state.done_bytes = current
+        state.total_size = total
         now = time.time()
-        if now - last_update < 0.8 and current < total:
-            return
-        last_update = now
-        elapsed = now - t0
-        speed = current / elapsed if elapsed > 0 else 0
-        pct = (current / total * 100) if total else 0
-        bar = progress_bar(current, total)
-        eta = ((total - current) / speed) if speed > 0 else 0
-        await tg_edit(chat_id, status_msg_id,
-                      f"⬇️ Descargando de Telegram (MTProto)\n"
-                      f"`{nombre[:40]}`\n\n"
-                      f"{bar} {pct:.0f}%\n"
-                      f"{human_size(current)} / {human_size(total)}\n"
-                      f"⚡ {human_speed(speed)} | ETA {int(eta)}s")
+        if now - last_update >= 1.0 or current >= total:
+            last_update = now
+            await update_status_message(state, phase="download")
 
-    # Pyrogram 2.x: download_media acepta file_id como string
     await app.download_media(file_id, file_name=dest_path, progress=on_progress)
     return dest_path
 
 
-# --- Upload a OJS por partes con barra de progreso --------------------------
+# --- Upload a OJS con progreso global unificado ----------------------------
 
 
 async def upload_to_ojs(journal, filepath, original_name, chat_id,
-                        status_msg_id):
-    """Sube `filepath` a `journal` por partes. Devuelve (lines, n_parts, sub)."""
+                        status_msg_id, op_id):
+    """Sube `filepath` a `journal` por partes con progreso global unificado.
+    El mensaje se edita UNA sola vez por segundo, mostrando un solo % que
+    combina todas las partes."""
+    state = ACTIVE_OPS.get(op_id)
+    if not state:
+        raise RuntimeError("Estado de operación no encontrado")
+
     host, _ = cargar_revista(journal)
     pw = OJS_PASS_REVCARD if journal == "revcardiologia" else OJS_PASS
     api = OJSApi(host, OJS_USER, pw, journal=journal)
     size = os.path.getsize(filepath)
 
-    await tg_edit(chat_id, status_msg_id,
-                  f"🔐 Logueando en *{journal}*...", force=True)
+    # El total incluye descarga (ya hecha) + subida (size)
+    state.total_size = size
+    state.done_bytes = 0
+    state.total_parts = max(1, (size + PART_MB * 1024 * 1024 - 1) //
+                            (PART_MB * 1024 * 1024))
+
+    # 1. Login
+    await update_status_message(state, phase="login", extra=f"Login {journal}")
     try:
         api.login()
     except Exception as e:
         raise RuntimeError(f"login {journal}: {e}")
 
-    await tg_edit(chat_id, status_msg_id,
-                  f"📝 Creando submission en *{journal}*...", force=True)
+    # 2. Crear submission
+    await update_status_message(state, phase="create",
+                                extra=f"Creando submission en {journal}")
     try:
         sub = int(api.create())
     except Exception as e:
         raise RuntimeError(f"crear submission {journal}: {e}")
 
     base, ext = safe_filename(original_name)
-    total_parts = max(1, (size + PART_MB * 1024 * 1024 - 1) //
-                      (PART_MB * 1024 * 1024))
+    total_parts = state.total_parts
 
     lines = [
         f"# «{original_name}» ({size} bytes), {PART_MB} MB por parte",
@@ -459,42 +660,46 @@ async def upload_to_ojs(journal, filepath, original_name, chat_id,
     idx = 0
     t_start = time.time()
     loop = asyncio.get_event_loop()
+
     with open(filepath, "rb") as f:
         while True:
+            if await is_cancelled(op_id):
+                raise asyncio.CancelledError("cancelado por usuario")
+
             data = f.read(PART_MB * 1024 * 1024)
             if not data:
                 break
             idx += 1
+            state.current_part = idx
             part_path = f"/tmp/{base}_parte{idx:03d}.{ext}"
             with open(part_path, "wb") as g:
                 g.write(data)
             part_size = len(data)
             part_t0 = time.time()
+            bytes_before_part = state.done_bytes
 
-            def cb(s, total, _idx=idx, _tot=total_parts,
-                   _t0=part_t0, _chat=chat_id, _msg=status_msg_id,
-                   _loop=loop, _journal=journal):
+            def cb(s, total, _idx=idx, _tot=total_parts, _t0=part_t0,
+                   _state=state, _bbp=bytes_before_part, _op=op_id,
+                   _chat=chat_id, _msg=status_msg_id, _loop=loop,
+                   _journal=journal, _part_size=part_size):
+                # Verificar cancelación
+                if _state.cancel_event.is_set():
+                    raise asyncio.CancelledError("cancelado")
+                # Actualizar bytes globales: bytes_before_part + s
+                _state.done_bytes = _bbp + s
+                _state.part_pct = (s / total * 100) if total else 0
+                # Throttle de edición a 1s
                 now = time.time()
-                elapsed = now - _t0
-                speed = s / elapsed if elapsed > 0 else 0
-                pct = (s / total * 100) if total else 0
-                bar = progress_bar(s, total)
-                eta = ((total - s) / speed) if speed > 0 else 0
-                global_pct = ((_idx - 1) + pct / 100) / _tot * 100
-                text = (
-                    f"☁️ Subiendo a *{_journal}* (parte {_idx}/{_tot})\n\n"
-                    f"{bar} {pct:.0f}% de esta parte\n"
-                    f"{human_size(s)} / {human_size(total)}\n"
-                    f"⚡ {human_speed(speed)} | ETA {int(eta)}s\n\n"
-                    f"📊 Global: {global_pct:.0f}% "
-                    f"({_idx-1}/{_tot} partes)"
-                )
-                try:
-                    fut = asyncio.run_coroutine_threadsafe(
-                        tg_edit(_chat, _msg, text), _loop)
-                    fut.result(timeout=2)
-                except Exception:
-                    pass
+                if now - _t0 > 0:  # siempre, el throttle está en tg_edit
+                    text = build_upload_status_text(_state, _journal)
+                    try:
+                        fut = asyncio.run_coroutine_threadsafe(
+                            tg_edit(_chat, _msg, text,
+                                    reply_markup=cancel_keyboard(_op),
+                                    force=False), _loop)
+                        fut.result(timeout=2)
+                    except Exception:
+                        pass
 
             try:
                 res = await loop.run_in_executor(
@@ -504,27 +709,109 @@ async def upload_to_ojs(journal, filepath, original_name, chat_id,
                         filename=os.path.basename(part_path),
                         progress_cb=cb))
                 lines.append(api.download_url(sub, res["id"]))
+                STATS["parts_uploaded"] = STATS.get("parts_uploaded", 0) + 1
+                persist_stats()
+            except asyncio.CancelledError:
+                # limpiar y salir
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+                raise
             except Exception as e:
                 err = str(e)[:200]
                 lines.append(f"# ERROR en parte {idx}: {err}")
-                await tg_edit(chat_id, status_msg_id,
-                              f"⚠️ Error en parte {idx}/{total_parts}: "
-                              f"`{err}`\nContinuando...", force=True)
+                STATS["errors"] = STATS.get("errors", 0) + 1
+                persist_stats()
             try:
                 os.remove(part_path)
             except OSError:
                 pass
+
     elapsed = time.time() - t_start
-    await tg_edit(chat_id, status_msg_id,
-                  f"✅ Subida completada en *{journal}*\n"
-                  f"`{idx}` partes en `{int(elapsed)}s`", force=True)
+    state.done_bytes = state.total_size
+    await update_status_message(state, phase="done",
+                                extra=f"✅ {idx} partes en {int(elapsed)}s")
+
+    STATS["uploads"] = STATS.get("uploads", 0) + 1
+    STATS["bytes_uploaded"] = STATS.get("bytes_uploaded", 0) + size
+    persist_stats()
+
+    # Registrar archivo en índice
+    file_entry = {
+        "name": original_name,
+        "size": size,
+        "size_human": human_size(size),
+        "ext": ext,
+        "journal": journal,
+        "submission_id": sub,
+        "parts": idx,
+        "date": datetime.now().isoformat(timespec="seconds"),
+        "ts": time.time(),
+        "md5": file_md5(filepath),
+        "links": [l for l in lines if not l.startswith("#")],
+    }
+    FILES_INDEX.setdefault("files", []).append(file_entry)
+    # mantener solo últimos 100
+    if len(FILES_INDEX["files"]) > 100:
+        FILES_INDEX["files"] = FILES_INDEX["files"][-100:]
+    persist_files_index()
+
     return lines, idx, sub
+
+
+def build_upload_status_text(state, journal):
+    """Construye el texto unificado del mensaje de estado de subida."""
+    elapsed = time.time() - state.start_time
+    speed = state.done_bytes / elapsed if elapsed > 0 else 0
+    eta = ((state.total_size - state.done_bytes) / speed
+           if speed > 0 else 0)
+    bar = progress_bar(state.done_bytes, state.total_size, width=20)
+    pct = state.global_pct
+    return (
+        f"☁️ *Subiendo a `{journal}`*\n"
+        f"📦 `{state.name[:40]}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{bar} *{pct:.1f}%*\n"
+        f"📦 {human_size(state.done_bytes)} / {human_size(state.total_size)}\n"
+        f"⚡ {human_speed(speed)} · ⏱ ETA {int(eta)}s\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Parte {state.current_part}/{state.total_parts}"
+    )
+
+
+async def update_status_message(state, phase="", extra=""):
+    """Actualiza el mensaje de estado del progreso."""
+    if not state.status_msg_id:
+        return
+    elapsed = time.time() - state.start_time
+    if phase == "download":
+        text = (
+            f"⬇️ *Descargando de Telegram*\n"
+            f"📦 `{state.name[:40]}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{state.status_line()}"
+        )
+    elif phase == "login":
+        text = f"🔐 *Autenticando...*\n\n{extra}"
+    elif phase == "create":
+        text = f"📝 *Preparando submission...*\n\n{extra}"
+    elif phase == "done":
+        text = f"✅ *Completado*\n\n{extra}"
+    else:
+        # subida
+        text = build_upload_status_text(state, "?")
+    kb = cancel_keyboard(state.op_id) if phase not in ("done",) else None
+    await tg_edit(state.chat_id, state.status_msg_id, text,
+                  reply_markup=kb, force=True)
 
 
 # --- Descarga de URL directa -----------------------------------------------
 
 
-async def download_url_direct(url, dest_dir, chat_id, status_msg_id):
+async def download_url_direct(url, dest_dir, chat_id, status_msg_id, op_id):
+    """Descarga URL directa con progreso y cancelación."""
+    state = ACTIVE_OPS.get(op_id)
     fname = url.rstrip("/").split("/")[-1] or "archivo.bin"
     fname = fname.split("?")[0]
     fname = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", fname)[:100]
@@ -538,23 +825,21 @@ async def download_url_direct(url, dest_dir, chat_id, status_msg_id):
         if r.status_code != 200:
             raise RuntimeError(f"HTTP {r.status_code}")
         total = int(r.headers.get("Content-Length", 0))
-        written = 0
-        last_edit = 0
-        t0 = time.time()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(128 * 1024):
                 if not chunk:
                     continue
                 f.write(chunk)
-                written += len(chunk)
-        return dest, total, t0
+        return dest, total
 
     loop = asyncio.get_event_loop()
-    dest, total, t0 = await loop.run_in_executor(None, _download)
-    # Como no podemos reportar progreso desde el thread, lo reportamos al final
+    dest, total = await loop.run_in_executor(None, _download)
+    if state:
+        state.total_size = total
+        state.done_bytes = total
     await tg_edit(chat_id, status_msg_id,
                   f"✅ Descargado: `{os.path.basename(dest)}` "
-                  f"({human_size(os.path.getsize(dest))})")
+                  f"({human_size(os.path.getsize(dest))})", force=True)
     return dest
 
 
@@ -563,9 +848,10 @@ async def download_url_direct(url, dest_dir, chat_id, status_msg_id):
 
 async def process_upload(msg_data):
     """Procesa un archivo recibido: lo descarga y sube a OJS."""
+    global LAST_ACTIVITY, STATS
+    LAST_ACTIVITY = time.time()
     chat_id = msg_data["chat"]["id"]
 
-    # Detectar archivo/media
     doc = msg_data.get("document")
     vid = msg_data.get("video")
     aud = msg_data.get("audio")
@@ -574,45 +860,36 @@ async def process_upload(msg_data):
     vnote = msg_data.get("video_note")
     photo = msg_data.get("photo")
 
-    media = None
     file_id = None
     nombre = None
     size = 0
 
     if doc:
-        media = doc
         file_id = doc.get("file_id")
         nombre = doc.get("file_name") or f"doc_{int(time.time())}.bin"
         size = doc.get("file_size", 0)
     elif vid:
-        media = vid
         file_id = vid.get("file_id")
         nombre = vid.get("file_name") or f"video_{int(time.time())}.mp4"
         size = vid.get("file_size", 0)
     elif aud:
-        media = aud
         file_id = aud.get("file_id")
         nombre = aud.get("file_name") or f"audio_{int(time.time())}.mp3"
         size = aud.get("file_size", 0)
     elif anim:
-        media = anim
         file_id = anim.get("file_id")
         nombre = f"gif_{int(time.time())}.mp4"
         size = anim.get("file_size", 0)
     elif voice:
-        media = voice
         file_id = voice.get("file_id")
         nombre = f"voice_{int(time.time())}.ogg"
         size = voice.get("file_size", 0)
     elif vnote:
-        media = vnote
         file_id = vnote.get("file_id")
         nombre = f"videonote_{int(time.time())}.mp4"
         size = vnote.get("file_size", 0)
     elif photo:
-        # última = mayor resolución
         biggest = photo[-1]
-        media = biggest
         file_id = biggest.get("file_id")
         nombre = f"foto_{int(time.time())}.jpg"
         size = biggest.get("file_size", 0)
@@ -629,41 +906,69 @@ async def process_upload(msg_data):
 
     size_human = human_size(size)
     status = await tg_send(chat_id,
-                           f"📥 Recibí `{nombre[:50]}` ({size_human}). "
-                           f"Nube: *{journal}*")
+                           f"📥 *Recibí* `{nombre[:50]}` ({size_human})\n"
+                           f"☁️ *Nube:* `{journal}`\n"
+                           f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                           f"⏳ Iniciando...")
     status_msg_id = (status or {}).get("result", {}).get("message_id")
     if not status_msg_id:
-        # reintentar sin markdown
         status = await tg_send(chat_id,
                                f"Recibi {nombre[:50]} ({size_human}). "
                                f"Nube: {journal}", parse_mode=None)
         status_msg_id = (status or {}).get("result", {}).get("message_id")
 
+    # Crear estado de operación
+    op_id = gen_op_id()
+    state = OperationState(op_id, chat_id, "upload", nombre,
+                           total_size=size)
+    state.status_msg_id = status_msg_id
+    ACTIVE_OPS[op_id] = state
+
     safe_name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", nombre)[:100]
     local = f"/tmp/tg_{int(time.time())}_{safe_name}"
 
-    # 1. Descargar de Telegram (Pyrogram MTProto)
+    # 1. Descargar de Telegram (MTProto)
     try:
-        await download_from_telegram(file_id, local, nombre, chat_id,
-                                     status_msg_id)
+        await download_from_telegram(file_id, local, nombre, op_id)
+    except asyncio.CancelledError:
+        await tg_edit(chat_id, status_msg_id,
+                      "❌ *Operación cancelada por el usuario.*",
+                      force=True)
+        try:
+            os.remove(local)
+        except OSError:
+            pass
+        ACTIVE_OPS.pop(op_id, None)
+        return
     except Exception as e:
         await tg_send(chat_id, f"❌ Descarga falló: `{str(e)[:200]}`")
         try:
             os.remove(local)
         except OSError:
             pass
+        ACTIVE_OPS.pop(op_id, None)
         return
 
     actual_size = os.path.getsize(local)
     LAST_FILE[chat_id] = local
+    STATS["downloads"] = STATS.get("downloads", 0) + 1
+    STATS["bytes_downloaded"] = STATS.get("bytes_downloaded", 0) + actual_size
+    persist_stats()
 
     # 2. Subir a OJS
     try:
         lines, n_parts, sub = await upload_to_ojs(
-            journal, local, nombre, chat_id, status_msg_id)
+            journal, local, nombre, chat_id, status_msg_id, op_id)
+    except asyncio.CancelledError:
+        await tg_edit(chat_id, status_msg_id,
+                      "❌ *Operación cancelada por el usuario.*",
+                      force=True)
+        ACTIVE_OPS.pop(op_id, None)
+        return
     except Exception as e:
         await tg_send(chat_id, f"❌ Error subiendo a *{journal}*:\n"
                                f"`{str(e)[:300]}`")
+        ACTIVE_OPS.pop(op_id, None)
         return
 
     # 3. Generar .txt con enlaces
@@ -675,12 +980,12 @@ async def process_upload(msg_data):
     if enlaces:
         PENDING_LINKS[str(chat_id)] = enlaces
 
-    # 4. Botones
+    # 4. Botones finales
     kb = [
         [{"text": "📋  Ver enlaces", "callback_data": "ver_enlaces"},
          {"text": "📜  Script", "callback_data": "script"}],
         [{"text": "☁️  Menú", "callback_data": "menu"},
-         {"text": "🛠  Ajustes", "callback_data": "config"}],
+         {"text": "📁  Archivos", "callback_data": "archivos"}],
     ]
 
     caption = (f"✅ *{n_parts} partes* subidas a *{journal}*\n"
@@ -700,11 +1005,13 @@ async def process_upload(msg_data):
                                f"arriba. Toca *Ver enlaces* para mostrarlos.",
                       reply_markup=kb)
 
+    ACTIVE_OPS.pop(op_id, None)
 
-# --- Dispatcher (handlers de texto y callbacks) ----------------------------
+
+# --- Handlers de texto -----------------------------------------------------
 
 
-async def handle_text(chat_id, text):
+async def handle_text(chat_id, text, user_id=None):
     global LAST_ACTIVITY, PART_MB
     LAST_ACTIVITY = time.time()
     text = (text or "").strip()
@@ -713,10 +1020,92 @@ async def handle_text(chat_id, text):
         await show_menu(chat_id)
         return
     if text.startswith("/ayuda") or text == "/help":
-        await tg_send(chat_id, help_text())
+        await tg_send(chat_id, help_text(), reply_markup=help_keyboard())
         return
     if text.startswith("/estado"):
         await tg_send(chat_id, estado_text())
+        return
+    if text.startswith("/stats"):
+        await tg_send(chat_id, stats_text())
+        return
+    if text.startswith("/archivos") or text == "/files":
+        await tg_send(chat_id, files_list_text(),
+                      reply_markup=[[{"text": "🏠  Menú",
+                                      "callback_data": "menu"}]])
+        return
+    if text.startswith("/info"):
+        p = LAST_FILE.get(chat_id)
+        info = file_info(p) if p and os.path.exists(p) else None
+        await tg_send(chat_id, file_detail_text(info))
+        return
+    if text.startswith("/borrar"):
+        p = LAST_FILE.get(chat_id)
+        if not p or not os.path.exists(p):
+            await tg_send(chat_id, "❌ No hay archivo reciente.")
+            return
+        try:
+            sz = os.path.getsize(p)
+            os.remove(p)
+            await tg_send(chat_id, f"🗑 Borrado: `{os.path.basename(p)}` "
+                                   f"({human_size(sz)})")
+            LAST_FILE[chat_id] = None
+        except OSError as e:
+            await tg_send(chat_id, f"❌ No pude borrar: `{e}`")
+        return
+    if text.startswith("/mover"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await tg_send(chat_id, "Uso: `/mover /tmp/destino/`")
+            return
+        dest_dir = parts[1].strip()
+        p = LAST_FILE.get(chat_id)
+        if not p or not os.path.exists(p):
+            await tg_send(chat_id, "❌ No hay archivo reciente.")
+            return
+        try:
+            Path(dest_dir).mkdir(parents=True, exist_ok=True)
+            new_path = os.path.join(dest_dir, os.path.basename(p))
+            shutil.move(p, new_path)
+            LAST_FILE[chat_id] = new_path
+            await tg_send(chat_id, f"📦 Movido a `{new_path}`")
+        except Exception as e:
+            await tg_send(chat_id, f"❌ No pude mover: `{e}`")
+        return
+    if text.startswith("/copiar"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await tg_send(chat_id, "Uso: `/copiar /tmp/destino/`")
+            return
+        dest_dir = parts[1].strip()
+        p = LAST_FILE.get(chat_id)
+        if not p or not os.path.exists(p):
+            await tg_send(chat_id, "❌ No hay archivo reciente.")
+            return
+        try:
+            Path(dest_dir).mkdir(parents=True, exist_ok=True)
+            new_path = os.path.join(dest_dir, os.path.basename(p))
+            shutil.copy2(p, new_path)
+            await tg_send(chat_id, f"📋 Copiado a `{new_path}`")
+        except Exception as e:
+            await tg_send(chat_id, f"❌ No pude copiar: `{e}`")
+        return
+    if text.startswith("/cola"):
+        if not ACTIVE_OPS:
+            await tg_send(chat_id, "📋 *Cola vacía.* No hay operaciones activas.")
+            return
+        msg = "📋 *Operaciones activas:*\n\n"
+        for op_id, st in ACTIVE_OPS.items():
+            msg += (f"• `{op_id}` ({st.kind})\n"
+                    f"  📦 `{st.name[:30]}` — {st.global_pct:.0f}%\n")
+        await tg_send(chat_id, msg)
+        return
+    if text.startswith("/cancelar") or text == "/cancel":
+        if not ACTIVE_OPS:
+            await tg_send(chat_id, "❌ No hay operaciones activas para cancelar.")
+            return
+        for op_id in list(ACTIVE_OPS.keys()):
+            await cancel_op(op_id)
+        await tg_send(chat_id, f"🛑 Cancelando {len(ACTIVE_OPS)} operación(es)...")
         return
     if text.startswith("/script"):
         script_path = HERE / "descargar_enlace.py"
@@ -833,35 +1222,56 @@ async def handle_text(chat_id, text):
         if not p or not os.path.exists(p):
             await tg_send(chat_id, "❌ No hay archivo reciente. Envíame uno primero.")
             return
-        await tg_send(chat_id, f"📄 `{os.path.basename(p)}`\n"
-                               f"📊 Tamaño: `{human_size(os.path.getsize(p))}`")
+        await tg_send(chat_id, file_detail_text(file_info(p)))
         return
 
     # URL directa?
     if text.startswith("http://") or text.startswith("https://"):
-        status = await tg_send(chat_id, "🔗 Procesando enlace...")
+        op_id = gen_op_id()
+        status = await tg_send(chat_id,
+                               f"🔗 *Procesando enlace...*\n`{text[:60]}`\n"
+                               f"━━━━━━━━━━━━━━━━━━━━━━━\n⏳ Iniciando...",
+                               reply_markup=cancel_keyboard(op_id))
         status_msg_id = (status or {}).get("result", {}).get("message_id")
         if not status_msg_id:
             return
+        state = OperationState(op_id, chat_id, "url", text)
+        state.status_msg_id = status_msg_id
+        ACTIVE_OPS[op_id] = state
         try:
             local = await download_url_direct(text, "/tmp", chat_id,
-                                                status_msg_id)
+                                                status_msg_id, op_id)
+        except asyncio.CancelledError:
+            await tg_edit(chat_id, status_msg_id,
+                          "❌ *Cancelado por el usuario.*", force=True)
+            ACTIVE_OPS.pop(op_id, None)
+            return
         except Exception as e:
             await tg_send(chat_id, f"❌ Descarga falló: `{str(e)[:200]}`")
+            ACTIVE_OPS.pop(op_id, None)
             return
         if not local or not os.path.exists(local):
             await tg_send(chat_id, "❌ Descarga falló: archivo no encontrado.")
+            ACTIVE_OPS.pop(op_id, None)
             return
         LAST_FILE[chat_id] = local
         size = os.path.getsize(local)
+        state.total_size = size
         await tg_send(chat_id, f"✅ Descargado: `{os.path.basename(local)}` "
                                f"({human_size(size)}). Subiendo a OJS...")
         journal = CHOSEN.get(str(chat_id), JOURNAL_DEFAULT)
         try:
             lines, n_parts, sub = await upload_to_ojs(
-                journal, local, os.path.basename(local), chat_id, status_msg_id)
+                journal, local, os.path.basename(local), chat_id,
+                status_msg_id, op_id)
+        except asyncio.CancelledError:
+            await tg_edit(chat_id, status_msg_id,
+                          "❌ *Cancelado por el usuario.*", force=True)
+            ACTIVE_OPS.pop(op_id, None)
+            return
         except Exception as e:
             await tg_send(chat_id, f"❌ Error subiendo: `{str(e)[:200]}`")
+            ACTIVE_OPS.pop(op_id, None)
             return
         txt = f"/tmp/enlaces_{Path(local).stem}.txt"
         with open(txt, "w", encoding="utf-8") as f:
@@ -872,6 +1282,7 @@ async def handle_text(chat_id, text):
         await tg_send_document(chat_id, txt,
                                caption=f"✅ {n_parts} partes en *{journal}* "
                                        f"(sub `{sub}`)")
+        ACTIVE_OPS.pop(op_id, None)
         return
 
     # Texto no reconocido
@@ -884,6 +1295,31 @@ async def handle_text(chat_id, text):
                   "• Usar /ayuda para ver todos los comandos.")
 
 
+async def show_menu(chat_id, edit_msg_id=None):
+    actual = CHOSEN.get(str(chat_id), JOURNAL_DEFAULT)
+    text = (
+        f"👋 *Bot OJS Cubanas* (Pyrogram · MTProto)\n\n"
+        f"☁️ *Nube actual:* `{actual}`\n"
+        f"📦 *Tamaño de parte:* `{PART_MB} MB` (máx 19 MB)\n\n"
+        f"*¿Qué puedo hacer?*\n"
+        f"• 📤 Subir archivos de *cualquier tamaño* a OJS por partes.\n"
+        f"• ⬇️ Descargar archivos grandes desde Telegram (sin límite).\n"
+        f"• 🌐 Descargar enlaces directos http(s).\n"
+        f"• 🎬 Renombrar, recortar, comprimir archivos.\n"
+        f"• 📁 Gestionar archivos: `/archivos`, `/info`, `/borrar`.\n"
+        f"• 📜 Enviarte `descargar_enlace.py`.\n\n"
+        f"👇 Elige una nube o envíame un archivo/enlace."
+    )
+    if edit_msg_id:
+        await tg_edit(chat_id, edit_msg_id, text,
+                      reply_markup=main_menu_keyboard(), force=True)
+    else:
+        await tg_send(chat_id, text, reply_markup=main_menu_keyboard())
+
+
+# --- Handlers de callback ---------------------------------------------------
+
+
 async def handle_callback(cb):
     global PART_MB, LAST_ACTIVITY
     LAST_ACTIVITY = time.time()
@@ -891,17 +1327,47 @@ async def handle_callback(cb):
     msg_id = cb["message"]["message_id"]
     data = cb.get("data", "")
     cb_id = cb.get("id")
+    user_id = cb.get("from", {}).get("id")
 
+    # Responder siempre al callback
     try:
         await answer_callback(cb_id)
     except Exception:
         pass
 
     if data == "help":
-        await tg_send(chat_id, help_text())
+        await tg_send(chat_id, help_text(), reply_markup=help_keyboard())
         return
     if data == "estado":
         await tg_send(chat_id, estado_text())
+        return
+    if data == "stats":
+        await tg_send(chat_id, stats_text())
+        return
+    if data == "archivos":
+        kb = [[{"text": "📄  Info último", "callback_data": "info"},
+               {"text": "🗑  Borrar último", "callback_data": "borrar"}],
+              [{"text": "🏠  Menú", "callback_data": "menu"}]]
+        await tg_send(chat_id, files_list_text(), reply_markup=kb)
+        return
+    if data == "info":
+        p = LAST_FILE.get(chat_id)
+        info = file_info(p) if p and os.path.exists(p) else None
+        await tg_send(chat_id, file_detail_text(info))
+        return
+    if data == "borrar":
+        p = LAST_FILE.get(chat_id)
+        if not p or not os.path.exists(p):
+            await tg_send(chat_id, "❌ No hay archivo reciente.")
+            return
+        try:
+            sz = os.path.getsize(p)
+            os.remove(p)
+            LAST_FILE[chat_id] = None
+            await tg_send(chat_id, f"🗑 Borrado: `{os.path.basename(p)}` "
+                                   f"({human_size(sz)})")
+        except OSError as e:
+            await tg_send(chat_id, f"❌ No pude borrar: `{e}`")
         return
     if data == "menu":
         await show_menu(chat_id, edit_msg_id=msg_id)
@@ -916,12 +1382,12 @@ async def handle_callback(cb):
         ])
         actual = CHOSEN.get(str(chat_id), JOURNAL_DEFAULT)
         await tg_edit(chat_id, msg_id,
-                     f"⚙️ *Ajustes*\n\n"
-                     f"• Revista: `{actual}`\n"
-                     f"• PART_MB: `{PART_MB}` MB\n"
-                     f"• Idle: `{IDLE_MIN}` min\n\n"
-                     f"👇 Toca para cambiar:",
-                     reply_markup=kb, force=True)
+                      f"⚙️ *Ajustes*\n\n"
+                      f"• Revista: `{actual}`\n"
+                      f"• PART_MB: `{PART_MB}` MB\n"
+                      f"• Idle: `{IDLE_MIN}` min\n\n"
+                      f"👇 Toca para cambiar:",
+                      reply_markup=kb, force=True)
         return
     if data == "script":
         script_path = HERE / "descargar_enlace.py"
@@ -965,6 +1431,19 @@ async def handle_callback(cb):
             text = "\n".join(enlaces)
             for i in range(0, len(text), 4000):
                 await tg_send(chat_id, f"```\n{text[i:i+4000]}\n```")
+        return
+
+    if data.startswith("cancel:"):
+        op_id = data.split(":", 1)[1]
+        ok = await cancel_op(op_id)
+        if ok:
+            await answer_callback(cb_id, "🛑 Cancelando...")
+            await tg_edit(chat_id, msg_id,
+                          f"🛑 *Cancelando operación...*\n`{op_id}`",
+                          force=True)
+        else:
+            await answer_callback(cb_id, "❌ Operación no encontrada",
+                                  show_alert=True)
         return
 
     if data.startswith("nube:"):
@@ -1011,35 +1490,35 @@ async def handle_callback(cb):
     await answer_callback(cb_id, "Acción no reconocida", show_alert=True)
 
 
+# --- Dispatcher ------------------------------------------------------------
+
+
 async def dispatch_update(up):
     """Procesa un update (message o callback_query)."""
     try:
         if "callback_query" in up:
             cb = up["callback_query"]
-            log.info(">>> Recibí callback_query: data=%s chat=%s",
-                     cb.get("data"), cb.get("message", {}).get("chat", {}).get("id"))
+            log.info(">>> Recibí callback: data=%s user=%s",
+                     cb.get("data"), cb.get("from", {}).get("id"))
             await handle_callback(cb)
         elif up.get("message"):
             msg = up["message"]
             chat_id = msg["chat"]["id"]
+            user_id = msg.get("from", {}).get("id")
             text = (msg.get("text") or "").strip()
-            log.info(">>> Recibí mensaje: chat=%s text=%r has_doc=%s has_video=%s",
+            log.info(">>> Recibí mensaje: chat=%s text=%r doc=%s video=%s",
                      chat_id, text[:50],
                      bool(msg.get("document")),
                      bool(msg.get("video")))
             if text:
-                await handle_text(chat_id, text)
+                await handle_text(chat_id, text, user_id)
             elif (msg.get("document") or msg.get("video") or
                   msg.get("audio") or msg.get("animation") or
                   msg.get("voice") or msg.get("video_note") or
                   msg.get("photo")):
                 await process_upload(msg)
         elif up.get("edited_message"):
-            # ignorar ediciones
             pass
-        else:
-            log.info(">>> Update no reconocido: %s",
-                     list(up.keys()))
     except Exception as e:
         log.exception(">>> dispatch error: %s", e)
 
@@ -1064,7 +1543,6 @@ async def polling_loop():
             if not data.get("ok"):
                 log.warning("getUpdates error: %s", data)
                 if data.get("error_code") == 409:
-                    # otro bot está corriendo; esperar más
                     await asyncio.sleep(30)
                 else:
                     await asyncio.sleep(5)
@@ -1072,7 +1550,6 @@ async def polling_loop():
             for up in data.get("result", []):
                 offset = up["update_id"] + 1
                 LAST_ACTIVITY = time.time()
-                # dispatch en background (no bloquear el polling)
                 asyncio.create_task(dispatch_update(up))
         except Exception as e:
             log.warning("polling loop error: %s", e)
@@ -1104,9 +1581,11 @@ def _run_http_server(port):
         def do_GET(self):
             if self.path in ("/", "/health", "/ping"):
                 body = (f"OK\nbot_alive=running\n"
+                        f"active_ops={len(ACTIVE_OPS)}\n"
                         f"pending_links_chats={len(PENDING_LINKS)}\n"
                         f"logs={len(LOG_BUFFER)}\n"
-                        f"pyrogram={'on' if (_pyrogram_app and _pyrogram_app.is_initialized) else 'pending'}\n").encode()
+                        f"pyrogram={'on' if (_pyrogram_app and _pyrogram_app.is_initialized) else 'pending'}\n"
+                        ).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
                 self.send_header("Content-Length", str(len(body)))
@@ -1125,12 +1604,16 @@ def _run_http_server(port):
                     "bot_alive": True,
                     "uptime_s": int(time.time() - START_TIME),
                     "last_activity_s": int(time.time() - LAST_ACTIVITY),
+                    "active_ops": len(ACTIVE_OPS),
+                    "queue_size": len(OP_QUEUE),
                     "pending_links_chats": len(PENDING_LINKS),
                     "chosen": CHOSEN,
                     "pyrogram_started": bool(
                         _pyrogram_app and _pyrogram_app.is_initialized),
+                    "stats": STATS,
+                    "files_indexed": len(FILES_INDEX.get("files", [])),
                     "log_buffer_size": len(LOG_BUFFER),
-                    "recent_logs": list(LOG_BUFFER)[-10:],
+                    "recent_logs": list(LOG_BUFFER)[-15:],
                 }, ensure_ascii=False, indent=2).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1168,11 +1651,10 @@ async def main_async():
 
     start_http_server_if_needed()
 
-    log.info(">>> Bot iniciando (arquitectura híbrida HTTP + Pyrogram lazy)...")
+    log.info(">>> Bot iniciando (v2 mejorada)...")
     log.info("Config: API_ID=%s, PART_MB=%d, JOURNAL_DEFAULT=%s, IDLE_MIN=%d",
              API_ID, PART_MB, JOURNAL_DEFAULT, IDLE_MIN)
-    log.info("Polling HTTP de getUpdates: ACTIVO")
-    log.info("Pyrogram MTProto: se iniciará cuando llegue el primer archivo")
+    log.info("Polling HTTP: ACTIVO | Pyrogram: lazy")
 
     asyncio.create_task(idle_watcher())
     asyncio.create_task(polling_loop())
