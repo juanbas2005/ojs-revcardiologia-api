@@ -498,7 +498,24 @@ async def download_url_direct(url, dest_dir, status_msg):
 
 
 async def download_with_ytdlp(url, dest_dir, status_msg):
-    """Descarga con yt-dlp (YouTube, TikTok, Instagram, etc.)."""
+    """Descarga con yt-dlp (YouTube, TikTok, Instagram, etc.).
+    Si yt-dlp no está instalado, avisa al usuario."""
+    # Verificar si yt-dlp está disponible
+    try:
+        proc_check = await asyncio.create_subprocess_exec(
+            "yt-dlp", "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
+        await proc_check.wait()
+        if proc_check.returncode != 0:
+            raise FileNotFoundError("yt-dlp no responde")
+    except FileNotFoundError:
+        raise RuntimeError(
+            "yt-dlp no está instalado en este servidor. Para usar "
+            "YouTube/TikTok/Instagram, pídele al administrador que ejecute "
+            "`pip install yt-dlp`. Mientras tanto, puedes enviarme el enlace "
+            "directo del archivo de video (URL .mp4).")
+
     await tg_edit(status_msg, f"🔎 Procesando con yt-dlp:\n`{url[:80]}`")
 
     cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "-o",

@@ -4,8 +4,10 @@
 # bot_telegram.py         (Pyrogram, requiere API_ID/API_HASH)
 # bot_telegram_simple.py  (solo requests, sin api_id/hash) — DEFAULT
 # descargar_enlace.py     (solo requests)
+#
+# yt-dlp es opcional (se instala solo si necesitas YouTube/TikTok/Instagram):
+#   pip install yt-dlp
 
 requests>=2.31
 pyrogram>=2.0
 tgcrypto>=1.2
-yt-dlp>=2024.0
