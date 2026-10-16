@@ -200,12 +200,18 @@ async def tg_send(chat_id, text, reply_markup=None, parse_mode="Markdown",
         data["reply_markup"] = json.dumps({"inline_keyboard": reply_markup})
     r = await tg_post("sendMessage", data=data, timeout=60)
     j = r.json()
-    if not j.get("ok") and j.get("error_code") == 429:
-        wait = j.get("parameters", {}).get("retry_after", 5)
-        log.warning("FloodWait sendMessage: %ss", wait)
-        await asyncio.sleep(wait + 1)
-        r = await tg_post("sendMessage", data=data, timeout=60)
-        j = r.json()
+    if not j.get("ok"):
+        log.warning(">>> sendMessage FAIL: chat=%s err=%s",
+                    chat_id, j.get("description", "?")[:200])
+        if j.get("error_code") == 429:
+            wait = j.get("parameters", {}).get("retry_after", 5)
+            log.warning("FloodWait sendMessage: %ss", wait)
+            await asyncio.sleep(wait + 1)
+            r = await tg_post("sendMessage", data=data, timeout=60)
+            j = r.json()
+    else:
+        log.info(">>> sendMessage OK: chat=%s msg_id=%s",
+                 chat_id, j.get("result", {}).get("message_id"))
     return j
 
 
@@ -1009,12 +1015,20 @@ async def dispatch_update(up):
     """Procesa un update (message o callback_query)."""
     try:
         if "callback_query" in up:
-            await handle_callback(up["callback_query"])
+            cb = up["callback_query"]
+            log.info(">>> Recibí callback_query: data=%s chat=%s",
+                     cb.get("data"), cb.get("message", {}).get("chat", {}).get("id"))
+            await handle_callback(cb)
         elif up.get("message"):
             msg = up["message"]
+            chat_id = msg["chat"]["id"]
             text = (msg.get("text") or "").strip()
+            log.info(">>> Recibí mensaje: chat=%s text=%r has_doc=%s has_video=%s",
+                     chat_id, text[:50],
+                     bool(msg.get("document")),
+                     bool(msg.get("video")))
             if text:
-                await handle_text(msg["chat"]["id"], text)
+                await handle_text(chat_id, text)
             elif (msg.get("document") or msg.get("video") or
                   msg.get("audio") or msg.get("animation") or
                   msg.get("voice") or msg.get("video_note") or
@@ -1023,8 +1037,11 @@ async def dispatch_update(up):
         elif up.get("edited_message"):
             # ignorar ediciones
             pass
+        else:
+            log.info(">>> Update no reconocido: %s",
+                     list(up.keys()))
     except Exception as e:
-        log.exception("dispatch error: %s", e)
+        log.exception(">>> dispatch error: %s", e)
 
 
 # --- Polling HTTP loop -----------------------------------------------------
