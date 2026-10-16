@@ -18,6 +18,7 @@ Arranque local:
 """
 import os
 import sys
+import time
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -95,17 +96,28 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     print(f"[INIT] Modo: {'Pyrogram' if USE_PYROGRAM else 'requests'}",
           flush=True)
+
+    # Render free requiere que el servicio responda HTTP rápido. Arrancamos
+    # el HTTP server PRIMERO en un thread daemon, y luego el bot.
+    port = int(os.environ.get("PORT", "10000"))
+    host = "0.0.0.0"
+    server = HTTPServer((host, port), Handler)
+    # Arrancar HTTP en background
+    http_thread = threading.Thread(target=server.serve_forever, daemon=True,
+                                   name="http")
+    http_thread.start()
+    print(f"[INIT] HTTP server escuchando en http://{host}:{port}", flush=True)
+    print(f"[INIT] Health-check: http://{host}:{port}/health", flush=True)
+
+    # Ahora arrancar el bot en background
     print("[INIT] Arrancando bot en background...", flush=True)
     start_bot_thread()
     print(f"[INIT] Bot thread: alive={BOT_THREAD.is_alive()}", flush=True)
 
-    port = int(os.environ.get("PORT", "10000"))
-    host = "0.0.0.0"
-    server = HTTPServer((host, port), Handler)
-    print(f"[INIT] HTTP server escuchando en http://{host}:{port}", flush=True)
-    print(f"[INIT] Health-check: http://{host}:{port}/health", flush=True)
+    # Mantener el thread principal vivo
     try:
-        server.serve_forever()
+        while True:
+            time.sleep(60)
     except KeyboardInterrupt:
         print("\n[INIT] Apagando...", flush=True)
         server.shutdown()
