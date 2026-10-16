@@ -1,44 +1,45 @@
-# Render Blueprint — Bot OJS Telegram
+# Render Blueprint — Bot OJS Telegram (Pyrogram)
 # ===========================================================================
-# DESPLIEGUE CON UN CLIC:
-#   1. Ve a https://render.com/deploy?REPO_URL=https://github.com/juanbas2005/ojs-revcardiologia-api
-#   2. Click "Apply" — Render detecta este render.yaml automáticamente.
-#   3. Elige el plan "Starter" (~$7/mes) para Background Worker 24/7.
-#   4. Listo. El bot arranca solo.
+# DESPLIEGUE:
+#   - El bot corre con Pyrogram (MTProto), soporta archivos de cualquier tamaño.
+#   - startCommand: python bot_telegram.py
+#   - Internamente arranca un HTTP server mínimo en $PORT para satisfacer
+#     el health check de Render free (responde /health).
 #
-# ALTERNATIVA GRATUITA (tier free con HTTP keep-alive):
-#   - Usa render_free.yaml en lugar de este archivo.
-#   - Ver instrucciones en GUIA.md § "Render (tier free)".
-#
-# CREDENCIALES: están embebidas abajo. El repo es PRIVADO, pero si en algún
-# momento lo haces público, ROTA todos los tokens (Telegram, GitHub) y las
-# claves OJS, y reemplaza los `value:` por `sync: false` (secret en Render).
+# PLAN:
+#   - free: 512 MB RAM, se duerme tras 15 min sin HTTP. Bot funciona pero
+#     se reconecta solo al despertar.
+#   - starter: 24/7 real, sin sleep (requiere tarjeta).
 # ===========================================================================
 services:
-  - type: worker
+  - type: web
     name: ojs-bot-telegram
     env: python
-    region: oregon  # oregon | frankfurt | singapore | ohio
-    plan: starter  # Background Worker requiere Starter (~$7/mes). 24/7 sin sleep.
+    region: oregon
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot_telegram_simple.py
-    autoDeploy: yes  # re-deploy automático al hacer push a master
-    healthCheckPath: ""  # workers no exponen HTTP; Render monitorea el proceso
+    startCommand: python bot_telegram.py
+    autoDeploy: yes
+    healthCheckPath: /health
     envVars:
-      # ---- Telegram ----
+      # ---- Telegram (REQUERIDAS) ----
       - key: TELEGRAM_BOT_TOKEN
         value: "8484852335:AAEPpjUhD9ZCRmcHBIiAgZ1bzQftSKMElQs"
-      # ---- Credenciales OJS (revistas cubanas) ----
+      - key: API_ID
+        value: "14681595"
+      - key: API_HASH
+        value: "a86730aab5c59953c424abb4396d32d5"
+      # ---- Credenciales OJS ----
       - key: OJS_USER
         value: "riroennis"
       - key: OJS_PASS
-        value: "Riroennis@2026"          # mil, rme, cocmed, ems, spu
+        value: "Riroennis@2026"
       - key: OJS_PASS_REVCARD
-        value: "Pupi@#1212"               # revcardiologia
-      # ---- Configuración del bot ----
+        value: "Pupi@#1212"
+      # ---- Configuración ----
       - key: OJS_JOURNAL
-        value: "revcardiologia"           # revista por defecto
+        value: "revcardiologia"
       - key: PART_MB
-        value: "5"                        # tamaño de parte al subir (máx 19)
+        value: "5"
       - key: IDLE_MIN
-        value: "0"                        # 0 = deshabilitado (corre 24/7 en Render)
+        value: "0"   # 0 = 24/7 (no cerrar por inactividad)
