@@ -1084,7 +1084,51 @@ def start_http_server_if_needed():
 # --- Main ------------------------------------------------------------------
 
 
+# --- Polling HTTP manual para bots (Pyrogram no lo hace solo) --------------
+# Pyrogram 2.x en modo bot NO hace getUpdates automáticamente. Tenemos que
+# hacer polling HTTP manual y alimentar los updates al dispatcher de Pyrogram.
+
+
+async def http_polling_loop():
+    """Hace long polling HTTP a getUpdates y pasa los updates a Pyrogram.
+    Esto es necesario porque Pyrogram espera updates push vía MTProto,
+    pero Telegram no los envía a bots (los bots deben hacer getUpdates)."""
+    import requests as _r
+    API_HTTP = f"https://api.telegram.org/bot{TOKEN}"
+    offset = 0
+    log.info(">>> Iniciando polling HTTP de getUpdates...")
+    while True:
+        try:
+            r = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: _r.get(f"{API_HTTP}/getUpdates",
+                               params={"timeout": 25, "offset": offset,
+                                       "allowed_updates": json.dumps(
+                                           ["message", "edited_message",
+                                            "callback_query"])},
+                               timeout=60))
+            data = r.json()
+            if not data.get("ok"):
+                log.warning("getUpdates error: %s", data)
+                await asyncio.sleep(5)
+                continue
+            for up in data.get("result", []):
+                offset = up["update_id"] + 1
+                # Pasar el update a Pyrogram para que los handlers se ejecuten
+                try:
+                    await app.handle_updates([up])
+                except Exception as e:
+                    log.warning("handle_updates error: %s", e)
+        except Exception as e:
+            log.warning("polling loop error: %s", e)
+            await asyncio.sleep(5)
+
+
+# --- Main ------------------------------------------------------------------
+
+
 async def main_async():
+    """Arranca el bot con Pyrogram + polling HTTP manual."""
     global LAST_ACTIVITY
     LAST_ACTIVITY = time.time()
 
@@ -1097,8 +1141,6 @@ async def main_async():
     except Exception as e:
         log.error(">>> FALLO app.start(): %s", e)
         log.error(">>> Traceback: %s", traceback.format_exc())
-        # mantener el proceso vivo para que Render no lo mate y podamos
-        # ver los logs via /logs
         while True:
             await asyncio.sleep(60)
             log.error(">>> Bot caído: %s", e)
@@ -1109,19 +1151,19 @@ async def main_async():
                  me.username, me.id)
     except Exception as e:
         log.error(">>> FALLO get_me(): %s", e)
-        log.error(">>> Traceback: %s", traceback.format_exc())
         while True:
             await asyncio.sleep(60)
 
     log.info("API_ID=%s, PART_MB=%d, JOURNAL_DEFAULT=%s, IDLE_MIN=%d",
              API_ID, PART_MB, JOURNAL_DEFAULT, IDLE_MIN)
 
+    # Arrancar el loop de polling HTTP en background
+    asyncio.create_task(http_polling_loop())
     asyncio.create_task(idle_watcher())
 
-    # Mantener vivo
-    while app.is_initialized:
+    # Mantener vivo el loop async
+    while True:
         await asyncio.sleep(2)
-    log.info("Saliendo del runner.")
 
 
 if __name__ == "__main__":
