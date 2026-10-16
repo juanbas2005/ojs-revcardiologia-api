@@ -22,8 +22,10 @@ import shutil
 import zipfile
 import logging
 import asyncio
+import traceback
 from pathlib import Path
 from datetime import datetime, timedelta
+from collections import deque
 
 # --- Bootstrap --------------------------------------------------------------
 HERE = Path(__file__).resolve().parent
@@ -56,6 +58,21 @@ requests.packages.urllib3.disable_warnings()
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("bot")
+
+# Buffer de logs en memoria (para diagnóstico via HTTP /logs)
+LOG_BUFFER = deque(maxlen=100)
+
+
+class BufferHandler(logging.Handler):
+    def emit(self, record):
+        LOG_BUFFER.append({
+            "time": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "level": record.levelname,
+            "msg": record.getMessage(),
+        })
+
+
+log.addHandler(BufferHandler())
 
 # --- Configuración ----------------------------------------------------------
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -1007,16 +1024,44 @@ def _run_http_server(port):
 
         def do_GET(self):
             if self.path in ("/", "/health", "/ping"):
+                bot_alive = app.is_initialized if 'app' in globals() else False
+                body = (f"OK\nbot_alive={bot_alive}\n"
+                        f"pending_links_chats={len(PENDING_LINKS)}\n"
+                        f"logs={len(LOG_BUFFER)}\n").encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(b"OK\n")
+                self.wfile.write(body)
+            elif self.path == "/logs":
+                # Devolver últimos logs en JSON
+                body = json.dumps(list(LOG_BUFFER), ensure_ascii=False,
+                                  indent=2).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/status":
+                body = json.dumps({
+                    "bot_alive": app.is_initialized if 'app' in globals() else False,
+                    "uptime_s": int(time.time() - START_TIME),
+                    "last_activity_s": int(time.time() - LAST_ACTIVITY),
+                    "pending_links_chats": len(PENDING_LINKS),
+                    "chosen": CHOSEN,
+                    "log_buffer_size": len(LOG_BUFFER),
+                    "recent_logs": list(LOG_BUFFER)[-10:],
+                }, ensure_ascii=False, indent=2).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             else:
                 self.send_response(404)
                 self.end_headers()
 
     try:
-        # allow_reuse_address para no fallar en restart
         socketserver.TCPServer.allow_reuse_address = True
         server = socketserver.TCPServer(("0.0.0.0", port), Handler)
         log.info("HTTP health server en puerto %d", port)
@@ -1046,10 +1091,28 @@ async def main_async():
     # Arrancar HTTP server en thread daemon (para Render health check)
     start_http_server_if_needed()
 
-    await app.start()
-    me = await app.get_me()
-    log.info("Bot iniciado como @%s (id=%s) con Pyrogram + MTProto",
-             me.username, me.id)
+    log.info(">>> Iniciando app.start() con Pyrogram...")
+    try:
+        await app.start()
+    except Exception as e:
+        log.error(">>> FALLO app.start(): %s", e)
+        log.error(">>> Traceback: %s", traceback.format_exc())
+        # mantener el proceso vivo para que Render no lo mate y podamos
+        # ver los logs via /logs
+        while True:
+            await asyncio.sleep(60)
+            log.error(">>> Bot caído: %s", e)
+
+    try:
+        me = await app.get_me()
+        log.info("Bot iniciado como @%s (id=%s) con Pyrogram + MTProto",
+                 me.username, me.id)
+    except Exception as e:
+        log.error(">>> FALLO get_me(): %s", e)
+        log.error(">>> Traceback: %s", traceback.format_exc())
+        while True:
+            await asyncio.sleep(60)
+
     log.info("API_ID=%s, PART_MB=%d, JOURNAL_DEFAULT=%s, IDLE_MIN=%d",
              API_ID, PART_MB, JOURNAL_DEFAULT, IDLE_MIN)
 
