@@ -1,43 +1,48 @@
 """
-Bot de Telegram (Pyrogram) para subir archivos a revistas OJS cubanas + extras.
+Bot de Telegram con Pyrogram — versión completa con soporte de archivos grandes.
+
+Ventajas sobre la versión simple (requests):
+  - Descarga archivos de CUALQUIER tamaño (no limitado a 20 MB como la API de bots).
+  - Descarga más rápida (MTProto en lugar de HTTPS getFile).
+  - Soporte async nativo.
+  - Soporte de mensajes largos, fotos, stickers, etc.
 
 Funcionalidades:
-  - Subida a OJS por partes de PART_MB MB (5 por defecto), renombrado a .pdf si
-    la extension no esta permitida por OJS. Genera .txt con los enlaces.
-  - Boton inline "Copiar enlaces" (un toque).
-  - Descarga de enlaces directos http(s) con barra de progreso.
-  - Descarga de YouTube / TikTok / Instagram via yt-dlp (si esta instalado).
-  - Admin de archivos: renombrar, recortar (primer/ultimos N bytes), comprimir
-    zip, ver tamano, borrar temporales (/temp, /limpiar).
-  - Ajustes: /config permite ver/cambiar revista por defecto, PART_MB, idioma.
-  - Comando /script envia descargar_enlace.py al chat.
-  - Persistencia: CHOSEN (revista por chat) se guarda en config.json local.
-  - Robustez: reintentos en login OJS, timeouts, manejo de errores visible.
+  - Subida a OJS por partes de PART_MB MB con renombrado a .pdf.
+  - Descarga de archivos de Telegram con BARRA DE PROGRESO (sin límite de tamaño).
+  - Descarga de enlaces directos http(s) y YouTube/TikTok/Instagram vía yt-dlp.
+  - Botones inline robustos: TODOS responden con answer_callback_query.
+  - Comando /ayuda /help completo.
+  - Comando /estado (uptime, memoria, última actividad).
+  - /script envía descargar_enlace.py.
+  - /config muestra y cambia revista por defecto y PART_MB.
+  - /temp y /limpiar gestionan archivos temporales.
+  - /renombrar, /recortar, /zip, /size sobre el último archivo.
+  - Persistencia de la revista elegida por chat en config.json.
+  - Throttle de ediciones: máximo 1 edición cada 0.8s.
+  - IDLE_MIN=0 deshabilita timeout (para Render/VPS 24/7).
 
-Variables de entorno (GitHub Secrets o .secrets/.env local):
-  TELEGRAM_BOT_TOKEN  - obligatorio
-  OJS_USER            - obligatorio
-  OJS_PASS            - password para mil/rme/cocmed/ems/spu
-  OJS_PASS_REVCARD    - password para revcardiologia
-  PART_MB             - tamano de parte en MB (default 5)
-  OJS_JOURNAL         - revista por defecto (default revcardiologia)
-  IDLE_MIN            - minutos de inactividad antes de cerrar (default 30)
-
-Pyrogram en modo bot no requiere api_id/api_hash (solo bot_token). Si se
-quiere MTProto user-mode, definir API_ID y API_HASH y SESSION_NAME.
+Variables de entorno (REQUERIDAS):
+  TELEGRAM_BOT_TOKEN  - token de @BotFather
+  API_ID              - de https://my.telegram.org/apps
+  API_HASH            - de https://my.telegram.org/apps
+  OJS_USER, OJS_PASS, OJS_PASS_REVCARD
+  PART_MB (default 5), OJS_JOURNAL (default revcardiologia),
+  IDLE_MIN (default 30).
 """
 import os
 import sys
+import re
 import json
 import time
 import shutil
 import zipfile
-import asyncio
 import logging
+import asyncio
 import subprocess
 from pathlib import Path
+from datetime import datetime, timedelta
 
-# --- bootstrap env ---------------------------------------------------------
 HERE = Path(__file__).resolve().parent
 ENV_LOCAL = HERE / ".secrets" / ".env"
 if not ENV_LOCAL.exists():
@@ -52,11 +57,20 @@ if ENV_LOCAL.exists():
 sys.path.insert(0, str(HERE))
 from ojs_api import OJSApi, cargar_revista  # noqa: E402
 
+# --- Pyrogram setup ---
+try:
+    from pyrogram import Client, filters
+    from pyrogram.types import (
+        Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup)
+    from pyrogram.errors import (
+        MessageNotModified, FloodWait, ChatIdInvalid, MessageTooLong)
+except ImportError:
+    sys.exit("Falta instalar pyrogram: pip install pyrogram tgcrypto")
+
 logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+                    format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("bot")
 
-# --- config -----------------------------------------------------------------
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OJS_USER = os.environ.get("OJS_USER", "")
 OJS_PASS = os.environ.get("OJS_PASS", "")
@@ -64,49 +78,46 @@ OJS_PASS_REVCARD = os.environ.get("OJS_PASS_REVCARD", "")
 PART_MB = int(os.environ.get("PART_MB", "5"))
 JOURNAL_DEFAULT = os.environ.get("OJS_JOURNAL", "revcardiologia")
 IDLE_MIN = int(os.environ.get("IDLE_MIN", "30"))
-IDLE_TIMEOUT = IDLE_MIN * 60
 
-# 19 MB es el limite confirmado en pruebas reales; PART_MB debe ser menor.
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+
 MAX_PART_MB = 19
 if PART_MB > MAX_PART_MB:
     log.warning("PART_MB=%d > limite real (%d); ajustando", PART_MB, MAX_PART_MB)
     PART_MB = MAX_PART_MB
 
-# Revistas compatibles (leidas de revistas.json)
-import json as _json
-REVISTAS_DICT = {}
-with open(HERE / "revistas.json", encoding="utf-8") as _f:
-    for _r in _json.load(_f)["revistas"]:
-        if _r.get("compatible"):
-            REVISTAS_DICT[_r["journal"]] = _r
+# revistas compatibles
+with open(HERE / "revistas.json", encoding="utf-8") as f:
+    REVISTAS_DICT = {r["journal"]: r for r in json.load(f)["revistas"]
+                     if r.get("compatible")}
 JOURNAL_SLUGS = list(REVISTAS_DICT.keys())
 
 EXT_PERMITIDAS = {"epub", "xml", "xls", "cvs", "doc", "docx", "pdf",
                   "jpg", "png", "html", "gif", "xlsx"}
 
-# --- persistence ------------------------------------------------------------
 CONFIG_FILE = HERE / "config.json"
 
 
 def load_config():
     if CONFIG_FILE.exists():
         try:
-            return _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         except Exception:
-            pass
+            return {}
     return {}
 
 
 def save_config(cfg):
     try:
-        CONFIG_FILE.write_text(_json.dumps(cfg, ensure_ascii=False, indent=2),
+        CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
                                encoding="utf-8")
     except Exception as e:
         log.warning("no pude guardar config.json: %s", e)
 
 
 CONFIG = load_config()
-CHOSEN = CONFIG.get("chosen", {})  # chat_id -> journal
+CHOSEN = CONFIG.get("chosen", {})
 
 
 def persist_chosen(chat_id, journal):
@@ -115,58 +126,46 @@ def persist_chosen(chat_id, journal):
     save_config(CONFIG)
 
 
-# --- Pyrogram ---------------------------------------------------------------
-# Pyrogram 2.x REQUIERE api_id y api_hash, incluso para bots.
-# Consiguelos GRATIS en https://my.telegram.org/apps (inicia sesion con tu
-# cuenta personal de Telegram, crea una nueva app, copia api_id y api_hash).
-# Luego definelos como variables de entorno (GitHub Secrets o .secrets/.env).
-try:
-    from pyrogram import Client, filters
-    from pyrogram.types import (
-        Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-        ReplyKeyboardMarkup, KeyboardButton)
-    from pyrogram.errors import (
-        MessageNotModified, ChatIdInvalid, FloodWait, MessageTooLong)
-except ImportError:
-    sys.exit("Falta instalar pyrogram: pip install pyrogram tgcrypto")
+LAST_FILE = {}  # chat_id -> path local
+PENDING_LINKS = {}  # chat_id -> lista de enlaces
+START_TIME = time.time()
+LAST_ACTIVITY = time.time()
 
-API_ID = int(os.environ["API_ID"]) if os.environ.get("API_ID") else None
-API_HASH = os.environ.get("API_HASH")
-SESSION_NAME = os.environ.get("SESSION_NAME", "ojs_bot")
+# Throttle de ediciones: 1 edición como máximo cada 0.8s por mensaje
+_last_edit = {}  # (chat_id, msg_id) -> last_edit_ts
+EDIT_THROTTLE_S = 0.8
+EDIT_LOCK = asyncio.Lock()
 
-if not API_ID or not API_HASH:
-    sys.exit(
-        "\n❌ Faltan API_ID y API_HASH.\n\n"
-        "Pyrogram 2.x los exige incluso para bots.\n"
-        "Como conseguirlos (gratis, ~3 min):\n"
-        "  1. Entra en https://my.telegram.org/apps con tu cuenta Telegram personal\n"
-        "  2. Crea una nueva app (cualquier nombre)\n"
-        "  3. Copia api_id (numero) y api_hash (cadena larga)\n"
-        "  4. Anadelos a GitHub Secrets (API_ID, API_HASH) o a .secrets/.env\n"
-        "  5. Vuelve a ejecutar este bot.\n\n"
-        "Alternativa sin api_id/hash: usar bot_telegram_simple.py "
-        "(version con requests, sin Pyrogram).\n")
-
+# Cliente Pyrogram
 app = Client("ojs_bot", api_id=API_ID, api_hash=API_HASH,
-             bot_token=TOKEN, workdir=str(HERE))
+             bot_token=TOKEN, workdir=str(HERE), in_memory=True)
 
 
-# --- helpers ----------------------------------------------------------------
+# --- helpers ---------------------------------------------------------------
 
-def progress_bar(done, total, width=10):
+
+def progress_bar(done, total, width=12):
     if total <= 0:
-        return "░" * width
+        return "░" * width + " ?"
     frac = min(done / total, 1.0)
     filled = int(frac * width)
     return "█" * filled + "░" * (width - filled)
 
 
 def human_size(n):
+    if n is None or n < 0:
+        return "?"
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024:
-            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
         n /= 1024
     return f"{n:.1f} PB"
+
+
+def human_speed(bps):
+    if bps <= 0:
+        return "? B/s"
+    return f"{human_size(bps)}/s"
 
 
 def safe_filename(name):
@@ -177,369 +176,296 @@ def safe_filename(name):
     return base + "." + ext, ext
 
 
-async def tg_send(chat_id, text, reply_markup=None):
-    """Envia un mensaje, troceando si supera el limite."""
-    try:
-        if len(text) > 4000:
+async def tg_send(chat_id, text, reply_markup=None, parse_mode="Markdown",
+                  disable_web_preview=True):
+    """Envía mensaje con manejo de FloodWait."""
+    for attempt in range(3):
+        try:
+            return await app.send_message(
+                chat_id, text, reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_preview)
+        except FloodWait as e:
+            log.warning("FloodWait sendMessage: %ss", e.value)
+            await asyncio.sleep(e.value + 1)
+        except MessageTooLong:
+            # trocear
             for i in range(0, len(text), 4000):
-                await app.send_message(chat_id, text[i:i+4000])
-        else:
-            await app.send_message(chat_id, text, reply_markup=reply_markup)
+                await app.send_message(chat_id, text[i:i+4000],
+                                       parse_mode=parse_mode)
+            return None
+        except Exception as e:
+            log.error("sendMessage: %s", e)
+            return None
+    return None
+
+
+async def tg_edit(msg, text, reply_markup=None, parse_mode="Markdown",
+                  force=False):
+    """Edita mensaje con throttle para evitar FloodWait."""
+    if msg is None:
+        return None
+    key = (msg.chat.id, msg.id)
+    now = time.time()
+    if not force:
+        async with EDIT_LOCK:
+            last = _last_edit.get(key, 0)
+            if now - last < EDIT_THROTTLE_S:
+                return None
+            _last_edit[key] = now
+    try:
+        return await msg.edit_text(text, reply_markup=reply_markup,
+                                   parse_mode=parse_mode)
+    except MessageNotModified:
+        return None
     except FloodWait as e:
         await asyncio.sleep(e.value + 1)
-        await tg_send(chat_id, text, reply_markup)
+        try:
+            return await msg.edit_text(text, reply_markup=reply_markup,
+                                       parse_mode=parse_mode)
+        except Exception:
+            return None
     except Exception as e:
-        log.error("tg_send: %s", e)
+        log.debug("edit_text: %s", e)
+        return None
 
 
-async def tg_edit(msg, text, reply_markup=None):
+async def tg_send_document(chat_id, path, caption=""):
+    """Envía documento con retry."""
+    for attempt in range(3):
+        try:
+            return await app.send_document(chat_id, path, caption=caption,
+                                           parse_mode="Markdown")
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+        except Exception as e:
+            log.error("sendDocument: %s", e)
+            return None
+    return None
+
+
+# --- menús ----------------------------------------------------------------
+
+
+def menu_keyboard():
+    kb = [[InlineKeyboardButton(f"☁️  {s}", callback_data=f"nube:{s}")]
+          for s in JOURNAL_SLUGS]
+    kb.append([InlineKeyboardButton("🛠  Ajustes", callback_data="config"),
+               InlineKeyboardButton("❓  Ayuda", callback_data="help"),
+               InlineKeyboardButton("📊  Estado", callback_data="estado")])
+    kb.append([InlineKeyboardButton("📜  Script descarga",
+                                    callback_data="script"),
+               InlineKeyboardButton("🧹  Limpiar temporales",
+                                    callback_data="limpiar")])
+    return InlineKeyboardMarkup(kb)
+
+
+async def show_menu(chat_id, edit_msg=None):
+    actual = CHOSEN.get(str(chat_id), JOURNAL_DEFAULT)
+    text = (
+        f"👋 *Bot OJS Cubanas* (Pyrogram, soporta archivos grandes)\n\n"
+        f"☁️ *Nube actual:* `{actual}`\n"
+        f"📦 *Tamaño de parte:* `{PART_MB} MB` (máx 19 MB)\n\n"
+        f"*¿Qué puedo hacer?*\n"
+        f"• 📤 Subir archivos a revistas OJS por partes.\n"
+        f"• ⬇️ Descargar archivos de cualquier tamaño (sin límite de 20 MB).\n"
+        f"• 🌐 Descargar enlaces directos http(s) y YouTube/TikTok/Instagram.\n"
+        f"• 🎬 Renombrar, recortar, comprimir archivos.\n"
+        f"• 📜 Enviarte `descargar_enlace.py`.\n\n"
+        f"👇 Elige una nube o envíame un archivo/enlace."
+    )
+    if edit_msg:
+        await tg_edit(edit_msg, text, reply_markup=menu_keyboard(), force=True)
+    else:
+        await tg_send(chat_id, text, reply_markup=menu_keyboard())
+
+
+def help_text():
+    return (
+        "❓ *Ayuda del Bot OJS* (Pyrogram)\n\n"
+        "*Comandos disponibles:*\n\n"
+        "📤 *Subir archivos a OJS:*\n"
+        "• Envía un archivo/documento/video/foto.\n"
+        "• Lo divido en partes de `5 MB` (máx 19 MB).\n"
+        "• Renombro a `.pdf` si la extensión no está permitida.\n"
+        "• Te devuelvo un `.txt` con todos los enlaces.\n\n"
+        "⬇️ *Descargar de Internet:*\n"
+        "• Enlace `http(s)` directo: lo descargo y subo.\n"
+        "• YouTube/TikTok/Instagram: uso `yt-dlp`.\n\n"
+        "⚙️ *Comandos:*\n"
+        "• `/start` `/menu` — Menú principal.\n"
+        "• `/ayuda` `/help` — Esta ayuda.\n"
+        "• `/estado` — Estado del bot (uptime, memoria).\n"
+        "• `/config` — Ver y cambiar ajustes.\n"
+        "• `/script` — Recibir `descargar_enlace.py`.\n"
+        "• `/temp` — Listar archivos temporales.\n"
+        "• `/limpiar` — Borrar archivos temporales.\n"
+        "• `/renombrar <nombre>` — Renombrar último archivo.\n"
+        "• `/recortar <bytes>` — Dejar solo los primeros N bytes.\n"
+        "• `/zip` — Comprimir último archivo en `.zip`.\n"
+        "• `/size` `/tamaño` — Tamaño del último archivo.\n\n"
+        "✅ *Sin límite de tamaño:* este bot usa Pyrogram (MTProto), así "
+        "que puede descargar archivos de cualquier tamaño desde Telegram.\n\n"
+        "⚠️ *Límites de OJS:* máximo `19 MB` por archivo subido.\n\n"
+        "💡 *Tip:* si falla una subida, usa `/limpiar` y reintenta."
+    )
+
+
+def estado_text():
+    uptime = int(time.time() - START_TIME)
+    idle = int(time.time() - LAST_ACTIVITY)
+    mem_mb = 0
     try:
-        await msg.edit_text(text, reply_markup=reply_markup)
-    except MessageNotModified:
+        import resource
+        mem_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        mem_mb = mem_kb / 1024 if mem_kb > 1024 * 1024 else mem_kb
+    except Exception:
         pass
-    except Exception as e:
-        log.debug("tg_edit: %s", e)
+    return (
+        f"📊 *Estado del Bot* (Pyrogram)\n\n"
+        f"• ⏱ *Uptime:* {timedelta(seconds=uptime)}\n"
+        f"• 🕐 *Última actividad:* {idle}s atrás\n"
+        f"• 💾 *Memoria:* {mem_mb:.0f} MB\n"
+        f"• ☁️ *Nube por defecto:* `{JOURNAL_DEFAULT}`\n"
+        f"• 📦 *PART_MB:* `{PART_MB}`\n"
+        f"• 🔢 *Revistas compatibles:* {len(JOURNAL_SLUGS)}\n"
+        f"• 🌐 *Modo:* {'24/7 (IDLE_MIN=0)' if IDLE_MIN == 0 else f'idle {IDLE_MIN}min'}\n"
+        f"• ⚡ *MTProto:* sí (sin límite de tamaño)"
+    )
 
 
-async def tg_download_with_progress(client, message, dest_path, status_msg):
-    """Descarga un archivo de Telegram mostrando progreso en status_msg."""
+# --- descarga de Telegram CON PYROGRAM (sin límite de 20 MB) ---------------
+
+
+async def download_from_telegram(client, message, dest_path, nombre,
+                                  status_msg):
+    """Descarga un archivo de Telegram vía MTProto con barra de progreso.
+    Soporta archivos de CUALQUIER tamaño (no está limitado a 20 MB)."""
     last_update = 0
+    t0 = time.time()
 
     async def on_progress(current, total):
-        nonlocal last_update
+        nonlocal last_update, t0
         now = time.time()
-        if now - last_update < 1.5 and current < total:
+        if now - last_update < 0.8 and current < total:
             return
         last_update = now
+        elapsed = now - t0
+        speed = current / elapsed if elapsed > 0 else 0
         pct = (current / total * 100) if total else 0
         bar = progress_bar(current, total)
-        try:
-            await status_msg.edit_text(
-                f"⬇️ Descargando de Telegram\n{bar} {pct:.0f}% "
-                f"({human_size(current)}/{human_size(total)})")
-        except MessageNotModified:
-            pass
-        except Exception:
-            pass
+        eta = ((total - current) / speed) if speed > 0 else 0
+        await tg_edit(status_msg,
+                      f"⬇️ Descargando de Telegram\n`{nombre[:40]}`\n\n"
+                      f"{bar} {pct:.0f}%\n"
+                      f"{human_size(current)} / {human_size(total)}\n"
+                      f"⚡ {human_speed(speed)} | ETA {int(eta)}s")
 
     await client.download_media(message, file_name=dest_path,
                                 progress=on_progress)
     return dest_path
 
 
-# --- OJS upload con progreso ------------------------------------------------
+# --- upload a OJS por partes con barra de progreso -------------------------
 
-async def upload_to_ojs(journal, filepath, original_name, chat_id, status_msg,
-                        user_chosen_size=None):
-    """Sube `filepath` a la revista `journal` por partes de PART_MB MB.
-    Devuelve (lista_enlaces, n_partes, submission_id) o lanza Exception.
-    """
+
+async def upload_to_ojs(journal, filepath, original_name, chat_id,
+                        status_msg):
+    """Sube `filepath` a `journal` por partes. Devuelve (lines, n_parts, sub)."""
     host, _ = cargar_revista(journal)
     pw = OJS_PASS_REVCARD if journal == "revcardiologia" else OJS_PASS
     api = OJSApi(host, OJS_USER, pw, journal=journal)
+    size = os.path.getsize(filepath)
+
+    # 1. Login
+    await tg_edit(status_msg, f"🔐 Logueando en *{journal}*...", force=True)
     try:
-        await tg_edit(status_msg, f"🔐 Login en {journal}...")
         api.login()
     except Exception as e:
         raise RuntimeError(f"login {journal}: {e}")
-    await tg_edit(status_msg, f"📝 Creando submission en {journal}...")
-    sub = int(api.create())
-    await tg_edit(status_msg,
-                 f"✅ Submission {sub} creada.\n📦 Partiendo en "
-                 f"{PART_MB} MB y subiendo a {journal}...")
 
-    base_name, ext = safe_filename(original_name)
-    size = os.path.getsize(filepath)
+    # 2. Crear submission
+    await tg_edit(status_msg,
+                  f"📝 Creando submission en *{journal}*...", force=True)
+    try:
+        sub = int(api.create())
+    except Exception as e:
+        raise RuntimeError(f"crear submission {journal}: {e}")
+
+    base, ext = safe_filename(original_name)
     total_parts = max(1, (size + PART_MB * 1024 * 1024 - 1) //
                       (PART_MB * 1024 * 1024))
 
     lines = [f"# «{original_name}» ({size} bytes), {PART_MB} MB por parte",
-             f"# Submission {sub} en {journal}"]
+             f"# Submission {sub} en {journal}",
+             f"# Fecha: {datetime.now().isoformat(timespec='seconds')}"]
     idx = 0
+    t_start = time.time()
+    loop = asyncio.get_event_loop()
     with open(filepath, "rb") as f:
         while True:
             data = f.read(PART_MB * 1024 * 1024)
             if not data:
                 break
             idx += 1
-            part_path = f"/tmp/{base_name}_parte{idx:03d}.{ext}"
+            part_path = f"/tmp/{base}_parte{idx:03d}.{ext}"
             with open(part_path, "wb") as g:
                 g.write(data)
-            await tg_edit(status_msg,
-                         f"☁️ Subiendo parte {idx}/{total_parts} a {journal}...")
+            part_size = len(data)
+            part_t0 = time.time()
 
-            def cb(sent, total, _idx=idx, _total_p=total_parts):
-                pct = (sent / total * 100) if total else 0
-                bar = progress_bar(sent, total)
-                loop = asyncio.get_event_loop()
-                loop.create_task(tg_edit(
-                    status_msg,
-                    f"☁️ Subiendo parte {_idx}/{_total_p} a {journal}\n"
-                    f"{bar} {pct:.0f}% ({human_size(sent)}/{human_size(total)})"))
+            def cb(s, total, _idx=idx, _tot=total_parts, _sz=part_size,
+                   _t0=part_t0):
+                # Esta función se llama desde un thread (requests), no desde
+                # el loop async. Usar asyncio.run_coroutine_threadsafe.
+                now = time.time()
+                elapsed = now - _t0
+                speed = s / elapsed if elapsed > 0 else 0
+                pct = (s / total * 100) if total else 0
+                bar = progress_bar(s, total)
+                eta = ((total - s) / speed) if speed > 0 else 0
+                global_pct = ((_idx - 1) + pct / 100) / _tot * 100
+                text = (
+                    f"☁️ Subiendo a *{journal}* (parte {_idx}/{_tot})\n\n"
+                    f"{bar} {pct:.0f}% de esta parte\n"
+                    f"{human_size(s)} / {human_size(total)}\n"
+                    f"⚡ {human_speed(speed)} | ETA {int(eta)}s\n\n"
+                    f"📊 Global: {global_pct:.0f}% ({_idx-1}/{_tot} partes)"
+                )
+                # Programar edición en el loop async
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(
+                        tg_edit(status_msg, text), loop)
+                    fut.result(timeout=2)
+                except Exception:
+                    pass
 
             try:
-                res = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda p=part_path, c=cb: api.upload(
+                res = await loop.run_in_executor(
+                    None, lambda p=part_path: api.upload(
                         sub, p, filename=os.path.basename(part_path),
-                        progress_cb=c))
+                        progress_cb=cb))
                 lines.append(api.download_url(sub, res["id"]))
             except Exception as e:
-                lines.append(f"# ERROR en parte {idx}: {e}")
+                err = str(e)[:200]
+                lines.append(f"# ERROR en parte {idx}: {err}")
+                await tg_edit(status_msg,
+                              f"⚠️ Error en parte {idx}/{total_parts}: "
+                              f"`{err}`\nContinuando...",
+                              force=True)
             try:
                 os.remove(part_path)
             except OSError:
                 pass
+    elapsed = time.time() - t_start
+    await tg_edit(status_msg,
+                  f"✅ Subida completada en {journal}\n"
+                  f"{idx} partes en {int(elapsed)}s", force=True)
     return lines, idx, sub
 
 
-# --- handlers ---------------------------------------------------------------
+# --- descarga URL directa con barra de progreso ----------------------------
 
-@app.on_message(filters.command(["start", "menu", "nube"]))
-async def cmd_start(_, m: Message):
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"☁️ {slug}", callback_data=f"nube:{slug}")]
-         for slug in JOURNAL_SLUGS] +
-        [[InlineKeyboardButton("🛠 Ajustes", callback_data="config"),
-          InlineKeyboardButton("ℹ️ Ayuda", callback_data="help")],
-         [InlineKeyboardButton("📜 Ver script de descarga",
-                              callback_data="script"),
-          InlineKeyboardButton("🧹 Limpiar temporales", callback_data="temp")]]
-    )
-    actual = CHOSEN.get(str(m.chat.id), JOURNAL_DEFAULT)
-    await m.reply(
-        f"👋 *Bot OJS Cubanas*\n\n"
-        f"Nube actual: `{actual}`\n\n"
-        f"*Qué puedo hacer:*\n"
-        f"• Subir archivos (PDF, etc.) a una revista OJS por partes de "
-        f"{PART_MB} MB y devolver un .txt con los enlaces de descarga.\n"
-        f"• Descargar de YouTube/TikTok/Instagram/enlaces directos.\n"
-        f"• Renombrar, recortar, comprimir (zip) archivos.\n"
-        f"• Enviarte el script `descargar_enlace.py` para bajar los enlaces "
-        f"en tu PC.\n\n"
-        f"Envíame un archivo, video, o un enlace para empezar.",
-        reply_markup=kb)
-
-
-@app.on_callback_query(filters.regex(r"^nube:"))
-async def cb_nube(_, c: CallbackQuery):
-    slug = c.data.split(":", 1)[1]
-    persist_chosen(c.message.chat.id, slug)
-    await c.answer(f"Nube: {slug}")
-    await c.message.edit_text(
-        f"✅ Nube elegida: *{slug}*\nAhora envíame un archivo o enlace.")
-
-
-@app.on_callback_query(filters.regex(r"^help$"))
-async def cb_help(_, c: CallbackQuery):
-    await c.answer()
-    await c.message.reply(
-        "*Ayuda*\n"
-        "• Envía un archivo/documento/video para subir a OJS por partes.\n"
-        "• Si la extensión no está permitida por OJS, la renombro a `.pdf`.\n"
-        "• Para descargar de Internet: envía un enlace http(s), YouTube, "
-        "TikTok o Instagram.\n"
-        "• `/script` te envía `descargar_enlace.py`.\n"
-        "• `/temp` muestra temporales; `/limpiar` los borra.\n"
-        "• `/config` muestra y cambia ajustes (revista por defecto, "
-        f"PART_MB).\n"
-        "• Botón *Copiar enlaces* disponible en el mensaje final.\n"
-        "• `/renombrar <nuevo>` renombra el último archivo procesado.\n"
-        "• `/recortar <n>` deja los primeros N bytes del último archivo.\n"
-        "• `/zip` comprime el último archivo en .zip")
-
-
-@app.on_callback_query(filters.regex(r"^script$"))
-async def cb_script(_, c: CallbackQuery):
-    await c.answer("Enviando script...")
-    script_path = HERE / "descargar_enlace.py"
-    if not script_path.exists():
-        await c.message.reply("❌ No encuentro `descargar_enlace.py`.")
-        return
-    await c.message.reply_document(
-        str(script_path),
-        caption=("📜 *descargar_enlace.py*\n\n"
-                 "Descarga archivos OJS desde enlaces del bot.\n\n"
-                 "Uso: `python descargar_enlace.py enlaces.txt`\n"
-                 "o: `python descargar_enlace.py 'URL'`\n"
-                 "o: `cat enlaces.txt | python descargar_enlace.py -`\n\n"
-                 "Guarda en `~/Descargas`. Lee credenciales de "
-                 "`.secrets/.env` o variables de entorno."))
-
-
-@app.on_callback_query(filters.regex(r"^temp$"))
-async def cb_temp(_, c: CallbackQuery):
-    await c.answer()
-    await cmd_temp_impl(c.message)
-
-
-@app.on_callback_query(filters.regex(r"^config$"))
-async def cb_config(_, c: CallbackQuery):
-    await c.answer()
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"📡 {s}", callback_data=f"setdef:{s}")]
-         for s in JOURNAL_SLUGS] +
-        [[InlineKeyboardButton("PART_MB +1", callback_data="partmb:1"),
-          InlineKeyboardButton("PART_MB -1", callback_data="partmb:-1"),
-          InlineKeyboardButton("PART_MB = 5", callback_data="partmb:5")]]
-    )
-    actual = CHOSEN.get(str(c.message.chat.id), JOURNAL_DEFAULT)
-    await c.message.reply(
-        f"⚙️ *Ajustes actuales*\n"
-        f"• Revista por defecto: `{actual}`\n"
-        f"• PART_MB: `{PART_MB}` MB (límite OJS: 19 MB)\n"
-        f"• Idle: `{IDLE_MIN}` min\n\n"
-        f"Cambia la revista por defecto o PART_MB:",
-        reply_markup=kb)
-
-
-@app.on_callback_query(filters.regex(r"^setdef:"))
-async def cb_setdef(_, c: CallbackQuery):
-    global JOURNAL_DEFAULT
-    slug = c.data.split(":", 1)[1]
-    persist_chosen(c.message.chat.id, slug)
-    await c.answer(f"Por defecto: {slug}")
-    await c.message.edit_text(f"✅ Revista por defecto cambiada a `{slug}`.")
-
-
-@app.on_callback_query(filters.regex(r"^partmb:"))
-async def cb_partmb(_, c: CallbackQuery):
-    global PART_MB
-    op = c.data.split(":", 1)[1]
-    if op == "5":
-        PART_MB = 5
-    else:
-        PART_MB = max(1, min(MAX_PART_MB, PART_MB + int(op)))
-    await c.answer(f"PART_MB = {PART_MB}")
-    await c.message.edit_text(
-        f"✅ PART_MB = *{PART_MB}* (límite OJS: {MAX_PART_MB} MB)")
-
-
-# --- estado por chat: ultimo archivo procesado ------------------------------
-LAST_FILE = {}  # chat_id -> path local
-
-
-@app.on_message(filters.command(["temp"]))
-async def cmd_temp(_, m: Message):
-    await cmd_temp_impl(m)
-
-
-async def cmd_temp_impl(m):
-    tmp = Path("/tmp")
-    files = sorted(tmp.glob("tg_*"), key=lambda p: p.stat().st_mtime,
-                   reverse=True)[:20]
-    if not files:
-        await m.reply("✅ No hay temporales en /tmp.")
-        return
-    txt = "🧹 *Temporales en /tmp* (últimos 20):\n"
-    total = 0
-    for p in files:
-        sz = p.stat().st_size
-        total += sz
-        txt += f"• `{p.name}` ({human_size(sz)})\n"
-    txt += f"\n*Total:* {human_size(total)}\nUsa `/limpiar` para borrarlos."
-    await m.reply(txt)
-
-
-@app.on_message(filters.command(["limpiar"]))
-async def cmd_limpiar(_, m: Message):
-    n = 0
-    freed = 0
-    for p in Path("/tmp").glob("tg_*"):
-        try:
-            sz = p.stat().st_size
-            p.unlink()
-            n += 1
-            freed += sz
-        except OSError:
-            pass
-    await m.reply(f"🧹 Limpié {n} archivos temporales "
-                 f"({human_size(freed)} liberados).")
-
-
-@app.on_message(filters.command(["script"]))
-async def cmd_script(_, m: Message):
-    script_path = HERE / "descargar_enlace.py"
-    if not script_path.exists():
-        await m.reply("❌ No encuentro `descargar_enlace.py`.")
-        return
-    await m.reply_document(
-        str(script_path),
-        caption="📜 *descargar_enlace.py* — ejecútalo en tu PC para bajar "
-                "los enlaces que produce el bot.")
-
-
-@app.on_message(filters.command(["config"]))
-async def cmd_config(_, m: Message):
-    await cb_config.__wrapped__(app, _fake_cb(m))
-
-
-def _fake_cb(m):
-    class _C:
-        def __init__(self, m):
-            self.message = m
-            self.data = "config"
-        async def answer(self, *a, **k): pass
-    return _C(m)
-
-
-@app.on_message(filters.command(["renombrar"]))
-async def cmd_renombrar(_, m: Message):
-    parts = m.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await m.reply("Uso: `/renombrar nuevo_nombre.pdf`")
-        return
-    new = parts[1].strip()
-    p = LAST_FILE.get(m.chat.id)
-    if not p or not os.path.exists(p):
-        await m.reply("❌ No hay archivo reciente para renombrar.")
-        return
-    new_path = os.path.join(os.path.dirname(p), new)
-    os.rename(p, new_path)
-    LAST_FILE[m.chat.id] = new_path
-    await m.reply_document(new_path, caption=f"✅ Renombrado a `{new}`")
-
-
-@app.on_message(filters.command(["recortar"]))
-async def cmd_recortar(_, m: Message):
-    parts = m.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].isdigit():
-        await m.reply("Uso: `/recortar 1000000` (deja 1 MB al inicio)")
-        return
-    n = int(parts[1])
-    p = LAST_FILE.get(m.chat.id)
-    if not p or not os.path.exists(p):
-        await m.reply("❌ No hay archivo reciente para recortar.")
-        return
-    new_path = p + ".recortado"
-    with open(p, "rb") as f, open(new_path, "wb") as g:
-        g.write(f.read(n))
-    LAST_FILE[m.chat.id] = new_path
-    await m.reply_document(new_path, caption=f"✅ Recortado a {human_size(n)}")
-
-
-@app.on_message(filters.command(["zip"]))
-async def cmd_zip_cmd(_, m: Message):
-    p = LAST_FILE.get(m.chat.id)
-    if not p or not os.path.exists(p):
-        await m.reply("❌ No hay archivo reciente para comprimir.")
-        return
-    zip_path = p + ".zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        z.write(p, os.path.basename(p))
-    LAST_FILE[m.chat.id] = zip_path
-    await m.reply_document(zip_path, caption="✅ Comprimido en .zip")
-
-
-@app.on_message(filters.command(["tamaño", "tamano", "size"]))
-async def cmd_size(_, m: Message):
-    p = LAST_FILE.get(m.chat.id)
-    if not p or not os.path.exists(p):
-        await m.reply("❌ No hay archivo reciente.")
-        return
-    await m.reply(f"📄 `{os.path.basename(p)}`: {human_size(os.path.getsize(p))}")
-
-
-# --- descargadores externos -------------------------------------------------
 
 async def download_url_direct(url, dest_dir, status_msg):
     """Descarga URL directa con barra de progreso."""
@@ -547,35 +473,34 @@ async def download_url_direct(url, dest_dir, status_msg):
     requests.packages.urllib3.disable_warnings()
     fname = url.rstrip("/").split("/")[-1] or "archivo.bin"
     fname = fname.split("?")[0]
+    fname = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", fname)[:100]
+    if not fname:
+        fname = "archivo.bin"
     dest = os.path.join(dest_dir, fname)
-    r = requests.get(url, stream=True, timeout=60, verify=False,
-                     headers={"User-Agent": "Mozilla/5.0"})
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}")
-    total = int(r.headers.get("Content-Length", 0))
-    written = 0
-    last = 0
-    with open(dest, "wb") as f:
-        for chunk in r.iter_content(64 * 1024):
-            if not chunk:
-                continue
-            f.write(chunk)
-            written += len(chunk)
-            now = time.time()
-            if now - last > 1.5:
-                last = now
-                pct = (written / total * 100) if total else 0
-                bar = progress_bar(written, total)
-                await tg_edit(status_msg,
-                              f"⬇️ {fname}\n{bar} {pct:.0f}% "
-                              f"({human_size(written)}/{human_size(total)})")
+
+    def _download():
+        r = requests.get(url, stream=True, timeout=60, verify=False,
+                         headers={"User-Agent": "Mozilla/5.0 (X11; Linux)"})
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        total = int(r.headers.get("Content-Length", 0))
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(128 * 1024):
+                if not chunk:
+                    continue
+                f.write(chunk)
+        return dest, total
+
+    # Ejecutar en thread para no bloquear el loop async
+    loop = asyncio.get_event_loop()
+    dest, total = await loop.run_in_executor(None, _download)
     return dest
 
 
 async def download_with_ytdlp(url, dest_dir, status_msg):
     """Descarga con yt-dlp (YouTube, TikTok, Instagram, etc.)."""
     await tg_edit(status_msg, f"🔎 Procesando con yt-dlp:\n`{url[:80]}`")
-    # -o: patron de salida; --no-playlist para evitar descargar listas enteras
+
     cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "-o",
            os.path.join(dest_dir, "%(title).80s.%(ext)s"), url]
     proc = await asyncio.create_subprocess_exec(
@@ -590,228 +515,519 @@ async def download_with_ytdlp(url, dest_dir, status_msg):
             await asyncio.sleep(0.2)
             continue
         text = line.decode("utf-8", errors="replace").strip()
-        # yt-dlp escribe progreso tipo "[download]  42.0% of 10.00MiB at 1.00MiB/s"
         if "[download]" in text and time.time() - last > 1.0:
             last = time.time()
             await tg_edit(status_msg, f"⬇️ yt-dlp\n`{text[:200]}`")
     if proc.returncode != 0:
         err = (await proc.stderr.read()).decode("utf-8", errors="replace")
         raise RuntimeError(f"yt-dlp falló: {err[:300]}")
-    # Buscar el archivo más reciente en dest_dir
-    files = sorted(Path(dest_dir).glob("*"), key=lambda p: p.stat().st_mtime,
-                   reverse=True)
+    files = sorted(Path(dest_dir).glob("*"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
     return str(files[0]) if files else None
 
 
 def is_ytdlp_url(url):
-    """Devuelve True si la URL parece de YouTube/TikTok/Instagram."""
     low = url.lower()
     return any(h in low for h in ("youtube.com", "youtu.be",
                                    "tiktok.com", "instagram.com",
                                    "instagr.am"))
 
 
-# --- procesar archivo de Telegram -> subir a OJS ----------------------------
+# --- procesar archivo recibido --------------------------------------------
+
 
 async def process_upload(client, m: Message):
     chat = m.chat.id
+    # Detectar el archivo/media
     doc = m.document or m.video or m.audio or m.animation or m.voice or \
         m.video_note
-    file_name = (m.document.file_name if m.document and
-                 m.document.file_name else None) or \
-        f"media_{int(time.time())}.mp4"
-    file_size = (doc.file_size or 0) if doc else 0
+    if not doc and m.photo:
+        # photo: la última es la de mayor resolución
+        doc = m.photo[-1] if m.photo else None
+        # photos son PhotoSize objects; el file_id está en el último
+    if not doc:
+        await tg_send(chat, "❌ No detecté ningún archivo en el mensaje.")
+        return
+
+    # Obtener nombre y tamaño
+    if hasattr(doc, "file_name") and doc.file_name:
+        nombre = doc.file_name
+    elif m.document and m.document.file_name:
+        nombre = m.document.file_name
+    elif m.video:
+        nombre = (m.video.file_name or
+                  f"video_{int(time.time())}.mp4")
+    elif m.audio:
+        nombre = (m.audio.file_name or
+                  f"audio_{int(time.time())}.mp3")
+    elif m.photo:
+        nombre = f"foto_{int(time.time())}.jpg"
+    else:
+        nombre = f"media_{int(time.time())}.bin"
+
+    size = getattr(doc, "file_size", 0) or 0
+    file_id = doc.file_id if hasattr(doc, "file_id") else None
+    if not file_id:
+        await tg_send(chat, "❌ No pude obtener file_id del archivo.")
+        return
+
     journal = CHOSEN.get(str(chat), JOURNAL_DEFAULT)
     if journal not in REVISTAS_DICT:
-        await m.reply(f"❌ Revista no válida: {journal}. Usa /start")
+        await tg_send(chat, f"❌ Revista no válida: `{journal}`. "
+                            f"Usa /start para elegir.")
         return
-    status = await m.reply(
-        f"📥 Recibí `{file_name}` ({human_size(file_size)}). "
-        f"Nube: *{journal}*")
-    tmp_dir = "/tmp"
-    local = os.path.join(tmp_dir, f"tg_{int(time.time())}_{file_name}")
+
+    size_human = human_size(size)
+    status = await tg_send(chat, f"📥 Recibí `{nombre[:50]}` ({size_human}). "
+                                f"Nube: *{journal}*")
+    if not status:
+        return
+
+    safe_name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", nombre)[:100]
+    local = f"/tmp/tg_{int(time.time())}_{safe_name}"
+
+    # 1. Descargar de Telegram (Pyrogram soporta cualquier tamaño)
     try:
-        await tg_download_with_progress(client, m, local, status)
+        await download_from_telegram(client, m, local, nombre, status)
     except Exception as e:
-        await m.reply(f"❌ No pude descargar de Telegram: {e}")
+        await tg_send(chat, f"❌ Descarga de Telegram falló: `{str(e)[:200]}`")
+        try:
+            os.remove(local)
+        except OSError:
+            pass
         return
+
+    actual_size = os.path.getsize(local)
     LAST_FILE[chat] = local
+
+    # 2. Subir a OJS
     try:
         lines, n_parts, sub = await upload_to_ojs(
-            journal, local, file_name, chat, status)
+            journal, local, nombre, chat, status)
     except Exception as e:
-        await m.reply(f"❌ Error subiendo a {journal}: {e}")
+        await tg_send(chat, f"❌ Error subiendo a *{journal}*:\n"
+                            f"`{str(e)[:300]}`")
         return
-    txt_path = os.path.join(tmp_dir, f"enlaces_{Path(file_name).stem}.txt")
-    with open(txt_path, "w", encoding="utf-8") as f:
+
+    # 3. Generar .txt con enlaces
+    txt = f"/tmp/enlaces_{Path(safe_name).stem}.txt"
+    with open(txt, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-    # Botón inline "Copiar enlaces"
     enlaces = [l for l in lines if not l.startswith("#")]
-    copy_payload = "\n".join(enlaces)[:4000]
+    errores = [l for l in lines if l.startswith("# ERROR")]
+    if enlaces:
+        PENDING_LINKS[str(chat)] = enlaces
+
+    # 4. Botones
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Copiar enlaces",
-                              callback_data="copy:" + str(hash(copy_payload)))],
-        [InlineKeyboardButton("📜 Ver script", callback_data="script"),
-         InlineKeyboardButton("🛠 Ajustes", callback_data="config")],
+        [InlineKeyboardButton("📋  Ver enlaces", callback_data="ver_enlaces"),
+         InlineKeyboardButton("📜  Script descarga", callback_data="script")],
+        [InlineKeyboardButton("☁️  Cambiar nube", callback_data="menu"),
+         InlineKeyboardButton("🛠  Ajustes", callback_data="config")],
     ])
-    # Guardar payload en memoria para el callback
-    COPY_PAYLOAD[str(chat)] = {str(hash(copy_payload)): copy_payload}
-    await m.reply_document(
-        txt_path,
-        caption=f"✅ *{n_parts} partes* subidas a *{journal}* (submission {sub})",
-        reply_markup=kb)
-    if len(enlaces) <= 8:
-        await m.reply("📋 *Enlaces:*\n" + "\n".join(enlaces))
+
+    caption = (f"✅ *{n_parts} partes* subidas a *{journal}*\n"
+               f"📦 Submission: `{sub}`\n"
+               f"📊 Tamaño: `{human_size(actual_size)}`")
+    if errores:
+        caption += f"\n⚠️ {len(errores)} parte(s) con error (ver .txt)"
+
+    await tg_send_document(chat, txt, caption=caption)
+
+    if len(enlaces) <= 4:
+        enlace_text = "\n".join(f"`{e}`" for e in enlaces)
+        await tg_send(chat, f"📋 *Enlaces generados:*\n\n{enlace_text}",
+                      reply_markup=kb)
     else:
-        await m.reply(f"📋 {len(enlaces)} enlaces en el .txt adjunto.")
+        await tg_send(chat, f"📋 *{len(enlaces)} enlaces* en el .txt adjunto "
+                            f"arriba. Toca *Ver enlaces* para mostrarlos aquí.",
+                      reply_markup=kb)
 
 
-COPY_PAYLOAD = {}
+# --- handlers --------------------------------------------------------------
 
 
-@app.on_callback_query(filters.regex(r"^copy:"))
-async def cb_copy(_, c: CallbackQuery):
-    h = c.data.split(":", 1)[1]
-    payload = COPY_PAYLOAD.get(str(c.message.chat.id), {}).get(h)
-    if not payload:
-        await c.answer("Enlaces expirados. Vuelve a subir el archivo.")
+@app.on_message(filters.command(["start", "menu", "nube"]))
+async def cmd_start(_, m: Message):
+    await show_menu(m.chat.id)
+
+
+@app.on_message(filters.command(["ayuda", "help"]))
+async def cmd_help(_, m: Message):
+    await tg_send(m.chat.id, help_text())
+
+
+@app.on_message(filters.command(["estado"]))
+async def cmd_estado(_, m: Message):
+    await tg_send(m.chat.id, estado_text())
+
+
+@app.on_message(filters.command(["script"]))
+async def cmd_script(_, m: Message):
+    script_path = HERE / "descargar_enlace.py"
+    if script_path.exists():
+        await tg_send_document(m.chat.id, str(script_path),
+                               caption="📜 *descargar_enlace.py* para bajar "
+                                       "los enlaces en tu PC.")
+    else:
+        await tg_send(m.chat.id, "❌ No encuentro `descargar_enlace.py`.")
+
+
+@app.on_message(filters.command(["temp"]))
+async def cmd_temp(_, m: Message):
+    files = sorted(Path("/tmp").glob("tg_*"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)[:20]
+    if not files:
+        await tg_send(m.chat.id, "✅ No hay archivos temporales en `/tmp`.")
         return
-    await c.answer("Enlaces copiados al portapapeles del mensaje siguiente.",
-                   show_alert=False)
-    await c.message.reply(
-        f"📋 *Enlaces (copia manual ya que Telegram no permite copiar "
-        f"directamente al portapapeles del cliente):*\n\n```\n{payload}\n```")
+    msg = "🧹 *Temporales* (últimos 20):\n\n"
+    total = 0
+    for p in files:
+        sz = p.stat().st_size
+        total += sz
+        msg += f"• `{p.name}` ({human_size(sz)})\n"
+    msg += f"\n📊 *Total:* {human_size(total)}\n\nUsa `/limpiar` para borrar."
+    await tg_send(m.chat.id, msg)
 
 
-# --- dispatcher principal ---------------------------------------------------
+@app.on_message(filters.command(["limpiar"]))
+async def cmd_limpiar(_, m: Message):
+    n, freed = 0, 0
+    for p in Path("/tmp").glob("tg_*"):
+        try:
+            sz = p.stat().st_size
+            p.unlink()
+            n += 1
+            freed += sz
+        except OSError:
+            pass
+    await tg_send(m.chat.id, f"🧹 Limpié *{n}* archivos "
+                             f"({human_size(freed)} liberados).")
 
-@app.on_message(filters.text & ~filters.command(["start", "menu", "nube",
-                                                 "help", "script", "temp",
-                                                 "limpiar", "config",
-                                                 "renombrar", "recortar",
-                                                 "zip", "tamaño", "tamano",
-                                                 "size"]))
-async def handle_text(_, m: Message):
-    """Texto: si parece URL, intenta descargar; si no, ayuda."""
+
+@app.on_message(filters.command(["config"]))
+async def cmd_config(_, m: Message):
+    kb = [[InlineKeyboardButton(f"📡  {s}", callback_data=f"setdef:{s}")]
+          for s in JOURNAL_SLUGS]
+    kb.append([InlineKeyboardButton("➕ PART_MB +1", callback_data="partmb:1"),
+               InlineKeyboardButton("➖ PART_MB -1", callback_data="partmb:-1"),
+               InlineKeyboardButton("↩️ 5 MB", callback_data="partmb:5")])
+    actual = CHOSEN.get(str(m.chat.id), JOURNAL_DEFAULT)
+    await tg_send(m.chat.id,
+                  f"⚙️ *Ajustes*\n\n"
+                  f"• Revista por defecto: `{actual}`\n"
+                  f"• PART_MB: `{PART_MB}` MB (límite OJS: 19 MB)\n"
+                  f"• Idle: `{IDLE_MIN}` min\n"
+                  f"• Bot: `@Uptimeriroobot` (Pyrogram)\n\n"
+                  f"👇 Toca para cambiar:",
+                  reply_markup=InlineKeyboardMarkup(kb))
+
+
+@app.on_message(filters.command(["renombrar"]))
+async def cmd_renombrar(_, m: Message):
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await tg_send(m.chat.id, "Uso: `/renombrar nuevo_nombre.pdf`")
+        return
+    new_name = parts[1].strip()
+    p = LAST_FILE.get(m.chat.id)
+    if not p or not os.path.exists(p):
+        await tg_send(m.chat.id, "❌ No hay archivo reciente. Envíame uno primero.")
+        return
+    new_path = os.path.join(os.path.dirname(p), new_name)
+    try:
+        os.rename(p, new_path)
+        LAST_FILE[m.chat.id] = new_path
+        await tg_send_document(m.chat.id, new_path,
+                               caption=f"✅ Renombrado a `{new_name}`")
+    except OSError as e:
+        await tg_send(m.chat.id, f"❌ No pude renombrar: `{e}`")
+
+
+@app.on_message(filters.command(["recortar"]))
+async def cmd_recortar(_, m: Message):
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await tg_send(m.chat.id, "Uso: `/recortar 1000000` (deja los primeros N bytes)")
+        return
+    n = int(parts[1].strip())
+    p = LAST_FILE.get(m.chat.id)
+    if not p or not os.path.exists(p):
+        await tg_send(m.chat.id, "❌ No hay archivo reciente. Envíame uno primero.")
+        return
+    new_path = p + ".recortado"
+    try:
+        with open(p, "rb") as f, open(new_path, "wb") as g:
+            g.write(f.read(n))
+        LAST_FILE[m.chat.id] = new_path
+        await tg_send_document(m.chat.id, new_path,
+                               caption=f"✅ Recortado a `{human_size(n)}`")
+    except OSError as e:
+        await tg_send(m.chat.id, f"❌ No pude recortar: `{e}`")
+
+
+@app.on_message(filters.command(["zip"]))
+async def cmd_zip(_, m: Message):
+    p = LAST_FILE.get(m.chat.id)
+    if not p or not os.path.exists(p):
+        await tg_send(m.chat.id, "❌ No hay archivo reciente. Envíame uno primero.")
+        return
+    zip_path = p + ".zip"
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.write(p, os.path.basename(p))
+        LAST_FILE[m.chat.id] = zip_path
+        await tg_send_document(m.chat.id, zip_path,
+                               caption=f"✅ Comprimido en `.zip` "
+                                       f"({human_size(os.path.getsize(zip_path))})")
+    except Exception as e:
+        await tg_send(m.chat.id, f"❌ No pude comprimir: `{e}`")
+
+
+@app.on_message(filters.command(["tamano", "tamaño", "size"]))
+async def cmd_size(_, m: Message):
+    p = LAST_FILE.get(m.chat.id)
+    if not p or not os.path.exists(p):
+        await tg_send(m.chat.id, "❌ No hay archivo reciente. Envíame uno primero.")
+        return
+    await tg_send(m.chat.id, f"📄 `{os.path.basename(p)}`\n"
+                             f"📊 Tamaño: `{human_size(os.path.getsize(p))}`")
+
+
+@app.on_message(filters.text & ~filters.command(
+    ["start", "menu", "nube", "ayuda", "help", "estado", "script", "temp",
+     "limpiar", "config", "renombrar", "recortar", "zip", "tamano",
+     "tamaño", "size"]))
+async def handle_text(client, m: Message):
+    """Texto: si es URL, descarga + sube. Si no, ayuda."""
+    global LAST_ACTIVITY
+    LAST_ACTIVITY = time.time()
     text = (m.text or "").strip()
     if not text:
         return
     if not (text.startswith("http://") or text.startswith("https://")):
-        await m.reply("Envíame un enlace (http/https), un archivo, o /start")
+        await tg_send(m.chat.id,
+                      "🤔 No reconocí ese mensaje.\n\n"
+                      "Puedes:\n"
+                      "• Enviarme un *archivo* (PDF, video, etc.).\n"
+                      "• Enviarme un *enlace* http(s).\n"
+                      "• Usar /start para el menú.\n"
+                      "• Usar /ayuda para ver todos los comandos.")
         return
-    status = await m.reply(f"🔗 Procesando enlace...")
-    tmp_dir = "/tmp"
+
+    status = await tg_send(m.chat.id, "🔗 Procesando enlace...")
+    if not status:
+        return
     try:
         if is_ytdlp_url(text):
-            local = await download_with_ytdlp(text, tmp_dir, status)
+            local = await download_with_ytdlp(text, "/tmp", status)
         else:
-            local = await download_url_direct(text, tmp_dir, status)
+            local = await download_url_direct(text, "/tmp", status)
     except Exception as e:
-        await m.reply(f"❌ Descarga falló: {e}")
+        await tg_send(m.chat.id, f"❌ Descarga falló: `{str(e)[:200]}`")
         return
     if not local or not os.path.exists(local):
-        await m.reply("❌ Descarga falló: archivo no encontrado.")
+        await tg_send(m.chat.id, "❌ Descarga falló: archivo no encontrado.")
         return
     LAST_FILE[m.chat.id] = local
-    await status.edit_text(
-        f"✅ Descargado: `{os.path.basename(local)}` "
-        f"({human_size(os.path.getsize(local))})\n\n"
-        f"¿Subir a OJS?", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("☁️ Sí, subir", callback_data="upload"),
-             InlineKeyboardButton("❌ No, solo guardar", callback_data="noop")]
-        ]))
-
-
-@app.on_callback_query(filters.regex(r"^upload$"))
-async def cb_upload(_, c: CallbackQuery):
-    chat = c.message.chat.id
-    local = LAST_FILE.get(chat)
-    if not local or not os.path.exists(local):
-        await c.answer("Archivo no disponible.")
-        return
-    await c.answer("Subiendo a OJS...")
-    journal = CHOSEN.get(str(chat), JOURNAL_DEFAULT)
-    status = await c.message.reply(f"☁️ Subiendo a {journal}...")
+    size = os.path.getsize(local)
+    await tg_send(m.chat.id, f"✅ Descargado: `{os.path.basename(local)}` "
+                             f"({human_size(size)}). Subiendo a OJS...")
+    journal = CHOSEN.get(str(m.chat.id), JOURNAL_DEFAULT)
     try:
         lines, n_parts, sub = await upload_to_ojs(
-            journal, local, os.path.basename(local), chat, status)
+            journal, local, os.path.basename(local), m.chat.id, status)
     except Exception as e:
-        await c.message.reply(f"❌ Error: {e}")
+        await tg_send(m.chat.id, f"❌ Error subiendo: `{str(e)[:200]}`")
         return
-    txt_path = f"/tmp/enlaces_{Path(local).stem}.txt"
-    with open(txt_path, "w", encoding="utf-8") as f:
+    txt = f"/tmp/enlaces_{Path(local).stem}.txt"
+    with open(txt, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-    await c.message.reply_document(
-        txt_path,
-        caption=f"✅ {n_parts} partes en {journal} (sub {sub})")
-
-
-@app.on_callback_query(filters.regex(r"^noop$"))
-async def cb_noop(_, c: CallbackQuery):
-    await c.answer("OK, archivo guardado en /tmp")
+    enlaces = [l for l in lines if not l.startswith("#")]
+    if enlaces:
+        PENDING_LINKS[str(m.chat.id)] = enlaces
+    await tg_send_document(m.chat.id, txt,
+                           caption=f"✅ {n_parts} partes en *{journal}* "
+                                   f"(sub `{sub}`)")
 
 
 @app.on_message(filters.document | filters.video | filters.audio |
-                filters.animation | filters.voice | filters.video_note)
+                filters.animation | filters.voice | filters.video_note |
+                filters.photo)
 async def handle_media(client, m: Message):
+    global LAST_ACTIVITY
+    LAST_ACTIVITY = time.time()
     await process_upload(client, m)
 
 
-# --- main -------------------------------------------------------------------
-
-LAST_ACTIVITY = time.time()
+# --- callbacks -------------------------------------------------------------
 
 
-def _bump():
-    global LAST_ACTIVITY
+@app.on_callback_query()
+async def handle_callback(client, c: CallbackQuery):
+    global PART_MB, LAST_ACTIVITY
     LAST_ACTIVITY = time.time()
+    chat = c.message.chat.id
+    msg = c.message
+    data = c.data or ""
+
+    # Responder siempre al callback para que el botón deje de "cargar"
+    try:
+        await c.answer()
+    except Exception:
+        pass
+
+    if data == "help":
+        await tg_send(chat, help_text())
+        return
+    if data == "estado":
+        await tg_send(chat, estado_text())
+        return
+    if data == "menu":
+        await show_menu(chat, edit_msg=msg)
+        return
+    if data == "config":
+        kb = [[InlineKeyboardButton(f"📡  {s}", callback_data=f"setdef:{s}")]
+              for s in JOURNAL_SLUGS]
+        kb.append([InlineKeyboardButton("➕ PART_MB +1", callback_data="partmb:1"),
+                   InlineKeyboardButton("➖ PART_MB -1",
+                                         callback_data="partmb:-1"),
+                   InlineKeyboardButton("↩️ 5 MB", callback_data="partmb:5")])
+        actual = CHOSEN.get(str(chat), JOURNAL_DEFAULT)
+        await tg_edit(msg,
+                      f"⚙️ *Ajustes*\n\n"
+                      f"• Revista: `{actual}`\n"
+                      f"• PART_MB: `{PART_MB}` MB\n"
+                      f"• Idle: `{IDLE_MIN}` min\n\n"
+                      f"👇 Toca para cambiar:",
+                      reply_markup=InlineKeyboardMarkup(kb), force=True)
+        return
+    if data == "script":
+        script_path = HERE / "descargar_enlace.py"
+        if script_path.exists():
+            await tg_send_document(chat, str(script_path),
+                                   caption="📜 *descargar_enlace.py*")
+        else:
+            await tg_send(chat, "❌ No encuentro `descargar_enlace.py`.")
+        return
+    if data == "limpiar":
+        n, freed = 0, 0
+        for p in Path("/tmp").glob("tg_*"):
+            try:
+                sz = p.stat().st_size
+                p.unlink()
+                n += 1
+                freed += sz
+            except OSError:
+                pass
+        await tg_edit(msg, f"🧹 Limpié *{n}* archivos "
+                           f"({human_size(freed)} liberados).", force=True)
+        return
+    if data == "ver_enlaces":
+        enlaces = PENDING_LINKS.get(str(chat), [])
+        if not enlaces:
+            await tg_send(chat, "❌ No hay enlaces recientes. Sube un archivo primero.")
+            return
+        if len(enlaces) <= 4:
+            text = "\n".join(f"`{e}`" for e in enlaces)
+        else:
+            text = "\n".join(f"`{e}`" for e in enlaces[:8])
+            text += f"\n\n... y {len(enlaces)-8} más."
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "📋  Copiar", callback_data="copiar_enlaces")]])
+        await tg_send(chat, f"📋 *Enlaces:*\n\n{text}", reply_markup=kb)
+        return
+    if data == "copiar_enlaces":
+        enlaces = PENDING_LINKS.get(str(chat), [])
+        if enlaces:
+            text = "\n".join(enlaces)
+            for i in range(0, len(text), 4000):
+                await tg_send(chat, f"```\n{text[i:i+4000]}\n```",
+                              parse_mode="Markdown")
+        return
+
+    if data.startswith("nube:"):
+        slug = data.split(":", 1)[1]
+        if slug not in REVISTAS_DICT:
+            await c.answer("Revista no válida", show_alert=True)
+            return
+        persist_chosen(chat, slug)
+        await c.answer(f"✅ Nube: {slug}")
+        await tg_edit(msg, f"✅ *Nube elegida:* `{slug}`\n\n"
+                           f"Ahora envíame el archivo que quieres subir.",
+                      force=True)
+        return
+
+    if data.startswith("setdef:"):
+        slug = data.split(":", 1)[1]
+        if slug not in REVISTAS_DICT:
+            await c.answer("Revista no válida", show_alert=True)
+            return
+        persist_chosen(chat, slug)
+        await c.answer(f"✅ Por defecto: {slug}")
+        await tg_edit(msg, f"✅ *Revista por defecto:* `{slug}`", force=True)
+        return
+
+    if data.startswith("partmb:"):
+        op = data.split(":", 1)[1]
+        old = PART_MB
+        if op == "5":
+            PART_MB = 5
+        else:
+            try:
+                PART_MB = max(1, min(MAX_PART_MB, PART_MB + int(op)))
+            except ValueError:
+                pass
+        await c.answer(f"✅ PART_MB = {PART_MB} MB")
+        await tg_edit(msg, f"✅ *PART_MB = `{PART_MB}` MB*\n"
+                           f"(antes: {old} MB, límite OJS: {MAX_PART_MB} MB)",
+                      force=True)
+        return
+
+    await c.answer("Acción no reconocida", show_alert=True)
+
+
+# --- bump actividad --------------------------------------------------------
 
 
 @app.on_message(group=1)
 async def _bump_activity(_, m: Message):
     """Refresca el timestamp de actividad (para idle timeout).
-    En grupo 1: corre despues de los handlers del grupo 0."""
-    _bump()
+    En grupo 1: corre después de los handlers del grupo 0."""
+    global LAST_ACTIVITY
+    LAST_ACTIVITY = time.time()
+
+
+# --- main ------------------------------------------------------------------
 
 
 async def idle_watcher():
     """Cierra el bot si pasa IDLE_MIN minutos sin actividad."""
     while True:
         await asyncio.sleep(60)
-        if time.time() - LAST_ACTIVITY > IDLE_TIMEOUT:
+        if IDLE_MIN > 0 and time.time() - LAST_ACTIVITY > IDLE_MIN * 60:
             log.info("Sin actividad por %d min, cerrando.", IDLE_MIN)
             await app.stop()
             return
 
 
-async def health_check():
-    """Verifica el estado del bot con getMe cada 5 min; relanza si esta caido."""
-    while True:
-        await asyncio.sleep(300)
-        try:
-            from pyrogram.raw.functions.users import GetFullUser as _unused
-            # el hecho de que el loop siga corriendo implica que app.is_initialized
-            if not app.is_initialized:
-                log.error("Bot desconectado; reiniciando...")
-                await app.stop()
-                await asyncio.sleep(3)
-                await app.start()
-        except Exception as e:
-            log.error("health_check: %s", e)
+async def main_async():
+    global LAST_ACTIVITY
+    LAST_ACTIVITY = time.time()
+    await app.start()
+    me = await app.get_me()
+    log.info("Bot iniciado como @%s (id=%s) con Pyrogram + MTProto",
+             me.username, me.id)
+    log.info("API_ID=%s, PART_MB=%d, JOURNAL_DEFAULT=%s, IDLE_MIN=%d",
+             API_ID, PART_MB, JOURNAL_DEFAULT, IDLE_MIN)
+    asyncio.create_task(idle_watcher())
+    while app.is_initialized:
+        await asyncio.sleep(2)
+    log.info("Saliendo del runner.")
 
 
 if __name__ == "__main__":
-    async def _runner():
-        await app.start()
-        me = await app.get_me()
-        log.info("Bot iniciado como @%s (id=%s)", me.username, me.id)
-        asyncio.create_task(idle_watcher())
-        asyncio.create_task(health_check())
-        # mantener vivo hasta que idle_watcher cancele
-        while app.is_initialized:
-            await asyncio.sleep(2)
-        log.info("Saliendo del runner.")
     try:
-        asyncio.run(_runner())
+        asyncio.run(main_async())
     except KeyboardInterrupt:
         log.info("Interrumpido por usuario.")
