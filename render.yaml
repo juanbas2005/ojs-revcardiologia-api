@@ -1,0 +1,44 @@
+# Render Blueprint — Bot OJS Telegram
+# ===========================================================================
+# DESPLIEGUE CON UN CLIC:
+#   1. Ve a https://render.com/deploy?REPO_URL=https://github.com/juanbas2005/ojs-revcardiologia-api
+#   2. Click "Apply" — Render detecta este render.yaml automáticamente.
+#   3. Elige el plan "Starter" (~$7/mes) para Background Worker 24/7.
+#   4. Listo. El bot arranca solo.
+#
+# ALTERNATIVA GRATUITA (tier free con HTTP keep-alive):
+#   - Usa render_free.yaml en lugar de este archivo.
+#   - Ver instrucciones en GUIA.md § "Render (tier free)".
+#
+# CREDENCIALES: están embebidas abajo. El repo es PRIVADO, pero si en algún
+# momento lo haces público, ROTA todos los tokens (Telegram, GitHub) y las
+# claves OJS, y reemplaza los `value:` por `sync: false` (secret en Render).
+# ===========================================================================
+services:
+  - type: worker
+    name: ojs-bot-telegram
+    env: python
+    region: oregon  # oregon | frankfurt | singapore | ohio
+    plan: starter  # Background Worker requiere Starter (~$7/mes). 24/7 sin sleep.
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_telegram_simple.py
+    autoDeploy: yes  # re-deploy automático al hacer push a master
+    healthCheckPath: ""  # workers no exponen HTTP; Render monitorea el proceso
+    envVars:
+      # ---- Telegram ----
+      - key: TELEGRAM_BOT_TOKEN
+        value: "8484852335:AAEPpjUhD9ZCRmcHBIiAgZ1bzQftSKMElQs"
+      # ---- Credenciales OJS (revistas cubanas) ----
+      - key: OJS_USER
+        value: "riroennis"
+      - key: OJS_PASS
+        value: "Riroennis@2026"          # mil, rme, cocmed, ems, spu
+      - key: OJS_PASS_REVCARD
+        value: "Pupi@#1212"               # revcardiologia
+      # ---- Configuración del bot ----
+      - key: OJS_JOURNAL
+        value: "revcardiologia"           # revista por defecto
+      - key: PART_MB
+        value: "5"                        # tamaño de parte al subir (máx 19)
+      - key: IDLE_MIN
+        value: "0"                        # 0 = deshabilitado (corre 24/7 en Render)

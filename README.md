@@ -3,6 +3,16 @@
 Sistema para subir archivos a revistas cubanas OJS 3.3 y descargarlos,
 con un bot de Telegram que automatiza el flujo.
 
+## 🚀 Despliegue con 1 clic en Render
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?REPO_URL=https://github.com/juanbas2005/ojs-revcardiologia-api)
+
+Click en el botón → entra a tu cuenta de Render → "Apply" → el bot arranca
+solo con todas las credenciales ya embebidas en `render.yaml`.
+
+**Plan recomendado:** Starter (~$7/mes) → Background Worker 24/7 sin sleep.
+**Plan free alternativo:** ver `render_free.yaml` + UptimeRobot (ver `GUIA.md`).
+
 ## Estructura
 
 ```
@@ -10,13 +20,17 @@ con un bot de Telegram que automatiza el flujo.
 ├── ojs_api.py               # Núcleo: login + subida + descarga OJS
 ├── bot_telegram.py          # Bot con Pyrogram (requiere API_ID/API_HASH)
 ├── bot_telegram_simple.py   # Bot con solo requests (sin api_id/hash) — DEFAULT
+├── web_server.py            # Wrapper HTTP para Render free (bot + keep-alive)
 ├── descargar_enlace.py      # Script standalone para descargar enlaces OJS
 ├── revistas.json            # Registro de revistas cubanas + límites MB
 ├── requirements.txt         # Dependencias Python
+├── .python-version          # Python 3.11 (Render lo usa)
+├── render.yaml              # Render Blueprint: Background Worker 24/7 (Starter)
+├── render_free.yaml         # Render Blueprint: Web Service free + keep-alive
 ├── tests/
 │   └── limite_archivo.py    # Prueba de límite de MB por revista
 ├── .github/workflows/
-│   ├── bot_keepalive.yml    # Workflow principal: bot + cron + health check
+│   ├── bot_keepalive.yml    # Workflow GitHub Actions (alternativa)
 │   ├── bot_telegram.yml     # Workflow legacy (dispatch manual)
 │   └── limite_subida.yml    # Probar límites (dispatch manual)
 ├── GUIA.md                  # Guía completa de uso

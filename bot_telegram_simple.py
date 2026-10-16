@@ -616,7 +616,8 @@ def main():
             except Exception as e:
                 log.exception("dispatch: %s", e)
             LAST_ACTIVITY = time.time()
-        if time.time() - LAST_ACTIVITY > IDLE_MIN * 60:
+        # IDLE_MIN=0 deshabilita el timeout (para Render/VPS 24/7)
+        if IDLE_MIN > 0 and time.time() - LAST_ACTIVITY > IDLE_MIN * 60:
             log.info("Sin actividad por %d min, cerrando job.", IDLE_MIN)
             return
 

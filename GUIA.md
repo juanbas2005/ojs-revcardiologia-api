@@ -162,6 +162,55 @@ python descargar_enlace.py enlaces.txt -o ~/Downloads
 
 ## 7. Mantener el bot 24/7
 
+### 🚀 Render (recomendado, 1 clic)
+
+Render es la forma más fácil de tener el bot corriendo 24/7 sin tocar nada.
+Tienes dos opciones:
+
+#### Opción A: Background Worker (Starter, ~$7/mes, 24/7 real)
+
+1. Click en el botón "Deploy to Render" del README, o ve a:
+   `https://render.com/deploy?REPO_URL=https://github.com/juanbas2005/ojs-revcardiologia-api`
+2. Entra a tu cuenta de Render (crea una gratis si no tienes).
+3. Render detecta `render.yaml` y muestra el servicio `ojs-bot-telegram`.
+4. Elige plan **Starter** (~$7/mes).
+5. Click **Apply**.
+6. El bot arranca automáticamente con todas las credenciales ya embebidas.
+7. En el dashboard de Render verás los logs en tiempo real.
+
+**Ventajas:**
+- 24/7 sin sleep, sin pausas, sin configurar nada más.
+- Auto-deploy: cada `git push` a master re-deploya automáticamente.
+- Logs centralizados, métricas, restart automático ante caída.
+
+#### Opción B: Web Service (FREE, con HTTP keep-alive)
+
+Para no pagar, puedes usar el tier gratuito de Render con `render_free.yaml`:
+
+1. En Render dashboard: **New → Web Service → Conecta tu repo GitHub**.
+2. En el blueprint, selecciona `render_free.yaml` (o renómbralo a `render.yaml`).
+3. Plan: **Free** (512 MB RAM, se duerme tras 15 min sin HTTP requests).
+4. Tras el deploy, copia la URL pública (algo como
+   `https://ojs-bot-telegram-free.onrender.com`).
+5. **Evitar el sleep:** crea un monitor gratuito en
+   [UptimeRobot](https://uptimerobot.com) (50 monitores gratis):
+   - Tipo: HTTP(s)
+   - URL: `https://TU-APP.onrender.com/health`
+   - Intervalo: cada 10 minutos
+6. UptimeRobot hará ping cada 10 min → Render no duerme el service → bot
+   corre indefinidamente.
+
+**Endpoints del web_server.py:**
+- `GET /` → info del bot (status, username, revistas).
+- `GET /health` → `OK` (200) para health-check.
+- `GET /ping` → alias de `/health`.
+
+**Límites del plan free de Render:**
+- 750 horas/mes de compute (alcanza para 1 servicio 24/7).
+- 512 MB RAM (suficiente para este bot).
+- Se duerme tras 15 min sin HTTP (de ahí el ping de UptimeRobot).
+- Cold start de ~30s al despertar (el bot se reconecta solo).
+
 ### GitHub Actions (limitado pero gratuito)
 
 El workflow `.github/workflows/bot_keepalive.yml`:
@@ -180,9 +229,7 @@ El workflow `.github/workflows/bot_keepalive.yml`:
 - Cron mínimo cada 5 minutos (usamos 30 min).
 - El workflow `concurrency` evita solapar jobs.
 
-### VPS / Replit / Always-on (recomendado para 24/7 real)
-
-GitHub Actions no es ideal para bots polling. Mejor:
+### VPS / Replit / Always-on (alternativas 24/7)
 
 - **VPS** (Hetzner, DigitalOcean, etc.): `systemd` service o `pm2`.
   ```ini
@@ -213,6 +260,14 @@ GitHub Actions no es ideal para bots polling. Mejor:
   ```cron
   */5 * * * * /opt/ojs-bot/.venv/bin/python /opt/ojs-bot/bot_telegram_simple.py
   ```
+
+### ⚠️ Importante: IDLE_MIN en 24/7
+
+- En Render/VPS donde quieres 24/7 real, define `IDLE_MIN=0`.
+- Con `IDLE_MIN=0` el bot NUNCA se cierra por inactividad (corre para siempre).
+- En GitHub Actions DEBES usar `IDLE_MIN=30` o más, porque los jobs tienen
+  timeout máximo de 6 horas y conviene cerrar antes para que el cron pueda
+  relanzar.
 
 ## 8. Revistas OJS soportadas
 
